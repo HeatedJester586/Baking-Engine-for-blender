@@ -43,12 +43,13 @@ repacked texel for texel**:
   looks the same as the original materials. Tick **Raw Data Maps** to keep
   their raw values instead (game-engine style). Normal maps are always read
   raw.
-- **Game-rip friendly.** A normal texture plugged straight into Normal
-  (without a Normal Map node) is used as a real tangent-space normal map.
-  Blender itself does not do that, so the original shows much less bump
-  detail; untick **Use Unwired Normal Maps** to leave those textures out
-  and match the original look. Such a texture also makes Blender ignore
-  that material's displacement bump, so its displacement is left out too.
+- **Copies miswired materials faithfully.** A normal texture plugged straight
+  into Normal (no Normal Map node) is not a normal map to Blender: it uses the
+  colour as a fixed direction and ignores that material's displacement. The
+  atlas reproduces exactly that look (checked against Cycles to within about
+  1°), while correctly wired normal maps are copied byte for byte. *Check
+  Materials* points these textures out and says whether they look like real
+  normal maps, in case the wiring was a mistake.
 - **Padding** of real neighbouring texels around every island, so
   mipmaps do not bleed.
 - **Material checker.** *Check Materials* lists every slot in the panel:
@@ -112,8 +113,6 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 | Atlas Size | Auto | Auto picks the smallest power of two that keeps every texel (up to 16384). A number caps the size. |
 | Lossless | on | Never shrink anything. If the textures do not fit, stop and list which materials need the room. |
 | Raw Data Maps | off | Off: sRGB-tagged roughness/metallic/height look exactly like in Blender. On: keep their raw values. |
-| Use Unwired Normal Maps | on | Normal textures without a Normal Map node: on = full bump detail, off = left out like Blender does. |
-| Per-material choices | – | After *Check Materials*, each material with an unwired normal texture or a displacement gets its own **Normal Map** / **Displacement** toggles (copies such as `.063`–`.074` share one). They override the default above. |
 | Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
 | Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |
@@ -167,8 +166,13 @@ normal-mapped island, alpha, emission, flat materials, an empty slot and 8
 UV maps. It then checks that every face samples exactly its original texels
 through the new UVs.
 
+`tests/normal_test.py` bakes the real shading normal with Cycles for an
+original and its atlas (normal textures wired straight into Normal and through
+a Normal Map node, on a rotated cube) and checks they match.
+
 ```bash
 blender -b --factory-startup --python tests/smoke_test.py
+blender -b --factory-startup --python tests/normal_test.py
 # or, with the bpy module from PyPI:
 pip install bpy && python tests/smoke_test.py
 ```

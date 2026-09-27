@@ -132,6 +132,9 @@ class ChannelSource:
         self.wrap = "REPEAT"
         self.strength = 1.0         # normal maps
         self.tangent_uv = None      # normal maps: UV map that defines tangents
+        # Normal texture wired straight into Normal: Blender uses its colour as a
+        # world-space direction, not as a tangent-space normal map.
+        self.world_normal = False
         # Color Ramp: grey = texture . ramp_input[0] * ramp_input[1] + ramp_input[2],
         # colour = ramp(grey); mask / scale / offset then apply to that colour.
         self.ramp = None            # (N, 4) lookup table over 0..1
@@ -218,7 +221,8 @@ class ChannelSource:
                     r(self.ramp_input[0]), r(self.ramp_input[1:]))
         return ("tex", texture_key(self.image), self.mask and r(self.mask), r(self.scale),
                 r(self.offset), self.uv_layer or default_uv, affine, self.wrap,
-                round(float(self.strength), 6), self.tangent_uv or default_uv, ramp)
+                round(float(self.strength), 6), self.tangent_uv or default_uv, ramp,
+                self.world_normal)
 
     def describe(self):
         if self.image is None:
@@ -455,7 +459,25 @@ def _resolve(socket, warn, depth=0):
     return ChannelSource(fallback)
 
 
-def _resolve_normal(socket, warn, depth=0, direct_normals=True):
+_NORMAL_LOOK = {}
+
+
+def _looks_like_normal_map(image):
+    """True if the image is mostly the lavender/purple of a tangent-space
+    normal map (average colour near 0.5, 0.5, 1)."""
+    key = (image.as_pointer(), image.filepath)
+    if key not in _NORMAL_LOOK:
+        try:
+            buf = np.empty(image.size[0] * image.size[1] * 4, np.float32)
+            image.pixels.foreach_get(buf)
+            r, g, b = buf.reshape(-1, 4)[::97, :3].mean(axis=0)
+            _NORMAL_LOOK[key] = b > 0.7 and abs(r - 0.5) < 0.15 and abs(g - 0.5) < 0.15
+        except Exception:
+            _NORMAL_LOOK[key] = False
+    return _NORMAL_LOOK[key]
+
+
+def _resolve_normal(socket, warn, depth=0):
     flat = ChannelSource(_DEFAULTS["Normal"])
     node, _ = _upstream(socket)
     if node is None:
@@ -475,20 +497,22 @@ def _resolve_normal(socket, warn, depth=0, direct_normals=True):
         return src
     if node.type == 'BUMP' and depth < 8:
         warn(f"Bump '{node.name}': height detail is not transferred, only its Normal input")
-        return _resolve_normal(node.inputs["Normal"], warn, depth + 1, direct_normals)
-    # A normal-map texture wired straight into Normal (common in game rips):
-    # treat it as the tangent-space normal map it is meant to be.
+        return _resolve_normal(node.inputs["Normal"], warn, depth + 1)
+    # A texture wired straight into Normal (no Normal Map node): Blender uses
+    # its colour as a world-space direction. Reproduce exactly that.
     src = _resolve(socket, warn, depth + 1)
-    if src.image is not None and direct_normals:
-        warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node; "
-             "it is used as a real normal map (Blender itself does not, so the original "
-             "shows less bump detail)", note=True)
-        return src
     if src.image is not None:
-        warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node, so "
-             "Blender does not use it as a normal map; it is left out to match the original",
-             note=True)
-        return flat
+        if _looks_like_normal_map(src.image):
+            hint = ("it looks like a normal map, so if you want its bumps, add a Normal Map "
+                    "node in the original material")
+        else:
+            hint = "it does not look like a normal map"
+        warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node: "
+             f"Blender uses its colour as a fixed direction and the atlas copies that look "
+             f"({hint})", note=True)
+        src.world_normal = True
+        src.strength = 1.0
+        return src
     warn(f"'{node.name}' ({node.bl_idname}) feeding Normal is not supported; using a flat normal")
     return flat
 
@@ -553,13 +577,11 @@ def _resolve_displacement(material, warn):
     return _resolve(socket, warn).to_scalar(), (0.0, 1.0)
 
 
-def build_plan(obj, direct_normals=True, overrides=None):
+def build_plan(obj):
     """Work out, for every material slot, where each PBR channel comes from.
 
-    ``overrides`` maps a material name to {"normal": bool, "displacement":
-    bool}, overriding ``direct_normals`` and the automatic displacement choice
-    for that material. Returns a list (one entry per slot) of dicts with
-    ``material``, ``sources`` ({channel: ChannelSource}) and ``warnings``.
+    Returns a list (one entry per slot) of dicts with ``material``,
+    ``sources`` ({channel: ChannelSource}) and ``warnings``.
     """
     slots = list(obj.material_slots) or [None]
     plan = []
@@ -591,16 +613,10 @@ def build_plan(obj, direct_normals=True, overrides=None):
         # atlas copies the original look, leave that displacement out too.
         normal_node = _upstream(bsdf.inputs["Normal"])[0] if bsdf is not None else None
         overridden = normal_node is not None and normal_node.type not in ('NORMAL_MAP', 'BUMP')
-        choice = (overrides or {}).get(material.name, {}) if material is not None else {}
-        use_normal = choice.get("normal", direct_normals)
         has_displacement = displacement is not None
-        keep_displacement = choice.get("displacement", not overridden or use_normal)
-        if has_displacement and not keep_displacement:
-            if "displacement" in choice:
-                warn("displacement turned off for this material", note=True)
-            else:
-                warn("its displacement does not show in Blender because a texture is plugged "
-                     "straight into Normal; it is left out to match the original", note=True)
+        if overridden and has_displacement:
+            warn("its displacement does not show in Blender because something is plugged "
+                 "straight into Normal; it is left out to match the original", note=True)
             height, displacement = ChannelSource(_DEFAULTS["Height"]), None
         for channel in CHANNELS:
             if channel == "Height":
@@ -608,7 +624,7 @@ def build_plan(obj, direct_normals=True, overrides=None):
             elif bsdf is None:
                 src = ChannelSource(_DEFAULTS[channel])
             elif channel == "Normal":
-                src = _resolve_normal(bsdf.inputs["Normal"], warn, direct_normals=use_normal)
+                src = _resolve_normal(bsdf.inputs["Normal"], warn)
             else:
                 socket = _bsdf_input(bsdf, channel)
                 src = _resolve(socket, warn) if socket is not None else ChannelSource(_DEFAULTS[channel])
@@ -625,8 +641,7 @@ def build_plan(obj, direct_normals=True, overrides=None):
             sources[channel] = src
         plan.append({"material": material, "sources": sources, "warnings": warnings,
                      "notes": notes, "displacement": displacement,
-                     "unwired_normal": overridden, "has_displacement": has_displacement,
-                     "use_normal": use_normal, "keep_displacement": keep_displacement})
+                     "unwired_normal": overridden, "has_displacement": has_displacement})
     _check_tiling(obj, plan)
     return plan
 
@@ -739,14 +754,14 @@ def _make_target(source):
 # Diagnostics
 # ---------------------------------------------------------------------------
 
-def diagnose(obj, direct_normals=True):
+def diagnose(obj):
     """Return a text report of what will be read from every material slot."""
     lines = ["=" * 72]
     if obj is None or obj.type != 'MESH':
         lines += ["PBR ATLAS DIAGNOSTIC: no mesh object selected", "=" * 72]
         return "\n".join(lines)
     mesh = obj.data
-    plan = build_plan(obj, direct_normals)
+    plan = build_plan(obj)
     face_mat = np.empty(len(mesh.polygons), np.int32)
     mesh.polygons.foreach_get("material_index", face_mat)
     counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
@@ -791,7 +806,7 @@ def _short(src):
     return text
 
 
-def check_materials(obj, direct_normals=True, overrides=None):
+def check_materials(obj):
     """What every material slot feeds into each channel, for the UI checker.
 
     Returns a list of dicts: ``name``, ``faces``, ``textures`` [(label, text)],
@@ -799,7 +814,7 @@ def check_materials(obj, direct_normals=True, overrides=None):
     None) and ``warnings``.
     """
     mesh = obj.data
-    plan = build_plan(obj, direct_normals, overrides)
+    plan = build_plan(obj)
     face_mat = np.empty(len(mesh.polygons), np.int32)
     mesh.polygons.foreach_get("material_index", face_mat)
     counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
@@ -822,17 +837,16 @@ def check_materials(obj, direct_normals=True, overrides=None):
             "emission": _short(emission) if emits else None,
             "displacement": _short(height) if entry["displacement"] is not None else None,
             "warnings": list(entry["warnings"]),
+            "notes": list(entry["notes"]),
             "material": mat.name if mat else None,
             "unwired_normal": entry["unwired_normal"],
             "has_displacement": entry["has_displacement"],
-            "use_normal": entry["use_normal"],
-            "keep_displacement": entry["keep_displacement"],
         })
     return rows
 
 
-def write_report(obj, direct_normals=True):
-    report = diagnose(obj, direct_normals)
+def write_report(obj):
+    report = diagnose(obj)
     text = bpy.data.texts.get(REPORT_TEXT) or bpy.data.texts.new(REPORT_TEXT)
     text.clear()
     text.write(report)
@@ -1304,6 +1318,9 @@ def _block(ctx, group, chunk, channel):
     # too, like Blender renders them, unless raw values were asked for.
     # Normal maps are always read raw (tangent-space vectors).
     decode = kind == "srgb" or (kind == "linear" and not ctx.raw_data)
+    world = channel == "Normal" and src.image is not None and src.world_normal
+    if world:
+        decode = True  # Blender colour-manages the colour before using it as a direction
     strength = src.strength if channel == "Normal" else 1.0
     if src.image is None:
         value = np.asarray(src.offset[:shape[2]], np.float32).reshape(1, 1, -1)
@@ -1317,7 +1334,7 @@ def _block(ctx, group, chunk, channel):
                  and np.allclose(_affine2x3(src.uv_affine), master.affine))
     if same_grid:
         raw = tex.block(chunk.x0, chunk.y0, chunk.w, chunk.h, src.wrap)
-        channels = _verbatim_channels(src, tex, kind, rotation, decode)
+        channels = None if world else _verbatim_channels(src, tex, kind, rotation, decode)
         if channels == [0, 1, 2]:
             return raw[..., :3]
         if channels is not None:
@@ -1329,8 +1346,126 @@ def _block(ctx, group, chunk, channel):
         linear = tex.mean(decode).reshape(1, 1, 4)
     else:
         linear = _resample(chunk, master, src, tex, decode)
+    if world:
+        return _world_normal_block(ctx, group, chunk, src, linear)
     encoded = _encode(_apply(src, linear, kind), kind, rotation, strength)
     return np.broadcast_to(encoded, shape)
+
+
+class _Geometry:
+    """World-space triangles of the source mesh, for normals that Blender
+    evaluates in world space."""
+
+    def __init__(self, obj, loops):
+        mesh = obj.data
+        mesh.calc_loop_triangles()
+        n = len(mesh.loop_triangles)
+        tri_loops = np.empty(n * 3, np.int32)
+        tri_poly = np.empty(n, np.int32)
+        mesh.loop_triangles.foreach_get("loops", tri_loops)
+        mesh.loop_triangles.foreach_get("polygon_index", tri_poly)
+        co = np.empty(len(mesh.vertices) * 3, np.float32)
+        mesh.vertices.foreach_get("co", co)
+        mw = np.array(obj.matrix_world, np.float64)
+        co = co.reshape(-1, 3).astype(np.float64) @ mw[:3, :3].T + mw[:3, 3]
+        self.tri_loops = tri_loops.reshape(n, 3).astype(np.int64)
+        self.tri_poly = tri_poly.astype(np.int64)
+        self.loop_pos = co[loops.loop_vertex]
+        self.n_loops = len(mesh.loops)
+
+
+def _group_triangles(ctx, group):
+    """Triangles of a group: local loop indices (n, 3) and tangent frames."""
+    if getattr(group, "_tris", None) is not None:
+        return group._tris
+    geo = ctx.geometry
+    local = np.full(geo.n_loops, -1, np.int64)
+    local[group.loops] = np.arange(len(group.loops))
+    tris = local[geo.tri_loops[np.isin(geo.tri_poly, group.faces)]]
+    tris = tris[(tris >= 0).all(axis=1)]
+    p = geo.loop_pos[group.loops][tris]          # (n, 3, 3) world positions
+    t = group.loop_texel[tris]                   # (n, 3, 2) texel coordinates
+    e1, e2 = p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]
+    d1, d2 = t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]
+    normal = np.cross(e1, e2)
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-20)
+    r = d1[:, 0] * d2[:, 1] - d2[:, 0] * d1[:, 1]
+    r = np.where(np.abs(r) < 1e-20, 1e-20, r)[:, None]
+    tangent = (e1 * d2[:, 1:2] - e2 * d1[:, 1:2]) / r
+    bitangent = (e2 * d1[:, 0:1] - e1 * d2[:, 0:1]) / r
+    tangent -= normal * (tangent * normal).sum(axis=1, keepdims=True)
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-20)
+    sign = np.sign((np.cross(normal, tangent) * bitangent).sum(axis=1, keepdims=True))
+    bitangent = np.cross(normal, tangent) * np.where(sign == 0, 1.0, sign)
+    group._tris = (tris, tangent, bitangent, normal)
+    return group._tris
+
+
+def _triangle_map(ctx, group, chunk):
+    """Which triangle covers each texel of the chunk (-1 = none), plus the
+    number of texels claimed by triangles facing different directions."""
+    tris, _, _, normal = _group_triangles(ctx, group)
+    index = next(i for i, c in enumerate(group.chunks) if c is chunk)
+    mine = np.flatnonzero(group.loop_chunk[tris[:, 0]] == index)
+    corners = (group.loop_texel[tris[mine]] - (chunk.x0, chunk.y0)) * chunk.scale
+    owner = np.full((chunk.ah, chunk.aw), -1, np.int64)
+    conflicts = 0
+    for k, (a, b, c) in zip(mine, corners):
+        lo = np.floor(np.minimum(np.minimum(a, b), c)).astype(int)
+        hi = np.ceil(np.maximum(np.maximum(a, b), c)).astype(int)
+        x0, y0 = max(lo[0], 0), max(lo[1], 0)
+        x1, y1 = min(hi[0], chunk.aw), min(hi[1], chunk.ah)
+        if x0 >= x1 or y0 >= y1:
+            continue
+        px, py = np.meshgrid(np.arange(x0, x1) + 0.5, np.arange(y0, y1) + 0.5)
+
+        def edge(u, v):
+            return (v[0] - u[0]) * (py - u[1]) - (v[1] - u[1]) * (px - u[0])
+
+        w0, w1, w2 = edge(b, c), edge(c, a), edge(a, b)
+        inside = ((w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)) | \
+                 ((w0 <= 1e-6) & (w1 <= 1e-6) & (w2 <= 1e-6))
+        if not inside.any():
+            continue
+        region = owner[y0:y1, x0:x1]
+        taken = inside & (region >= 0)
+        if taken.any():
+            conflicts += int(((normal[region[taken]] * normal[k]).sum(axis=1) < 0.9).sum())
+        region[inside] = k
+    # Texels no triangle covers (padding, slivers) copy their nearest neighbour;
+    # only the padding border is ever sampled, so a few passes are enough.
+    for _ in range(24):
+        empty = owner < 0
+        if not empty.any() or empty.all():
+            break
+        prev = owner.copy()
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            dst = owner[max(dy, 0):chunk.ah + min(dy, 0), max(dx, 0):chunk.aw + min(dx, 0)]
+            src = prev[max(-dy, 0):chunk.ah + min(-dy, 0), max(-dx, 0):chunk.aw + min(-dx, 0)]
+            take = (dst < 0) & (src >= 0)
+            dst[take] = src[take]
+    if (owner < 0).any():
+        owner[owner < 0] = mine[0] if len(mine) else 0
+    return owner, conflicts
+
+
+def _world_normal_block(ctx, group, chunk, src, linear):
+    """Tangent-space normals reproducing a texture wired straight into Normal:
+    Blender uses its (colour-managed) colour as a world-space direction."""
+    tris, tangent, bitangent, normal = _group_triangles(ctx, group)
+    if not len(tris):
+        return np.broadcast_to(np.array([128, 128, 255], np.uint8), (chunk.ah, chunk.aw, 3))
+    owner, conflicts = _triangle_map(ctx, group, chunk)
+    if conflicts:
+        ctx.warn(f"'{src.image.name}': some texels are shared by faces pointing different ways "
+                 "(overlapping UVs); its fixed direction can only match one of them there")
+    direction = np.broadcast_to(_apply(src, linear, "normal"), (chunk.ah, chunk.aw, 3))
+    length = np.linalg.norm(direction, axis=-1, keepdims=True)
+    direction = np.where(length > 1e-8, direction / np.maximum(length, 1e-8), normal[owner])
+    ts = np.stack([(direction * tangent[owner]).sum(-1),
+                   (direction * bitangent[owner]).sum(-1),
+                   (direction * normal[owner]).sum(-1)], axis=-1)
+    return np.rint(np.clip(ts * 0.5 + 0.5, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def _flat_values(ctx, group, chunk, channels):
@@ -1346,9 +1481,10 @@ def _flat_values(ctx, group, chunk, channels):
 
 
 class _Context:
-    def __init__(self, cache, default_uv, warn, raw_data=False):
+    def __init__(self, cache, default_uv, warn, raw_data=False, geometry=None):
         self.cache, self.default_uv, self.warn = cache, default_uv, warn
         self.raw_data = raw_data
+        self.geometry = geometry
 
 
 # ---------------------------------------------------------------------------
@@ -1605,7 +1741,7 @@ def _write_text(name, lines):
 
 
 def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
-                lossless=True, raw_data=False, direct_normals=True, overrides=None, log=print):
+                lossless=True, raw_data=False, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
 
     ``max_size`` 0 means Auto: the smallest power of two that holds every
@@ -1639,7 +1775,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
             warnings.append(msg)
             log("  ! " + msg)
 
-    plan = build_plan(source, direct_normals, overrides)
+    plan = build_plan(source)
     for i, entry in enumerate(plan):
         for w in entry["warnings"]:
             warn(f"slot {i:02d}: {w}")
@@ -1684,7 +1820,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
         _BACKGROUND["Height"] = (int(round(min(max(mid, 0.0), 1.0) * 255)),) * 3
         channels.append("Height")
 
-    ctx = _Context(cache, loops.default_uv, warn, raw_data)
+    ctx = _Context(cache, loops.default_uv, warn, raw_data, _Geometry(source, loops))
     flat_size = max(4, 2 * padding)
     for g in groups:
         g.master = _pick_master(g, cache, loops.default_uv, warn)
@@ -1809,7 +1945,6 @@ if __name__ == "__main__":
     MAX_ATLAS_SIZE = 0      # 0 = Auto; else the smallest power of two that fits, up to this
     LOSSLESS = True         # never shrink textures; stop with an explanation instead
     RAW_DATA = False        # True = sRGB-tagged roughness/metallic maps keep raw values
-    DIRECT_NORMALS = True   # use normal textures plugged in without a Normal Map node
     PADDING = 8             # texels of real texture kept around every UV island
     OUTPUT_DIR = None       # None = textures only inside the .blend;
                             # or a folder for PNG copies, e.g. "//atlas_textures/"
@@ -1819,4 +1954,4 @@ if __name__ == "__main__":
     print(write_report(source_obj))
     if not DIAGNOSE_ONLY:
         build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR,
-                    lossless=LOSSLESS, raw_data=RAW_DATA, direct_normals=DIRECT_NORMALS)
+                    lossless=LOSSLESS, raw_data=RAW_DATA)

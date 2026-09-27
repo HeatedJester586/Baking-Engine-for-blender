@@ -31,6 +31,10 @@ RNG = np.random.default_rng(7)
 PADDING = 4
 
 
+def srgb_decode(v):
+    return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+
+
 def noise(size, gray=False):
     px = RNG.integers(0, 256, (size, size, 4), dtype=np.uint8)
     if gray:
@@ -220,9 +224,6 @@ def build_scene():
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
 
-    def srgb_decode(v):
-        return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
-
     srgb = lambda v: int(round(float(baker._linear_to_srgb(np.float64(v))) * 255))
     lin = lambda v: int(round(v * 255))
     flat_normal = (128, 128, 255)
@@ -252,11 +253,13 @@ def build_scene():
                  # sRGB-tagged data maps look like Blender renders them (gamma-decoded)
                  "Roughness": ("map", px["whammy_rough"], [0], srgb_decode),
                  "Metallic": ("map", px["whammy_metal"], [0], srgb_decode),
-                 "Normal": ("tex", px["whammy_normal"], [0, 1, 2], 1)}
-    # Displacement: (0, 1) and (0.5, 0.1) share one Displacement node whose range
-    # covers both: scale 1.05, midlevel 0.05 / 1.05.
-    scale, mid = 1.05, 0.05 / 1.05
-    expect[9]["Height"] = ("map", px["whammy_height"], [0], lambda h: h / scale + mid)
+                 # Unwired normal texture: Blender uses its colour-managed colour as a
+                 # world-space direction. This face lies flat (tangent = world axes).
+                 "Normal": ("dir", px["whammy_normal"])}
+    # The unwired normal hides slot 9's displacement in Blender, so only the knob's
+    # (midlevel 0.5, scale 0.1) is left and is used as is.
+    scale, mid = 0.1, 0.5
+    expect[9]["Height"] = int(round(mid * 255))
     expect[10] = {"BaseColor": ("tex", px["knob_base"], [0, 1, 2], 1),
                   "Height": ("map", px["knob_height"], [0], lambda h: (h - 0.5) * 0.1 / scale + mid)}
     expect[0]["Height"] = int(round(mid * 255))
@@ -287,13 +290,11 @@ def main():
 
     rows = baker.check_materials(source)
     ok &= check([i for i, r in enumerate(rows) if r["emission"]] == [3]
-                and [i for i, r in enumerate(rows) if r["displacement"]] == [9, 10]
+                and [i for i, r in enumerate(rows) if r["displacement"]] == [10]
                 and ("Normal", "TEX_Guitar_02_Normal") in rows[9]["textures"],
                 "material checker lists textures, emission and displacement per slot")
-    original_look = baker.check_materials(source, direct_normals=False)
-    ok &= check(original_look[9]["displacement"] is None and rows[9]["displacement"] is not None
-                and original_look[10]["displacement"] is not None,
-                "unwired normal hides that material's displacement when matching the original")
+    ok &= check(rows[9]["displacement"] is None and rows[10]["displacement"] is not None,
+                "an unwired normal hides that material's displacement, like in Blender")
     ok &= check(not rows[9]["warnings"] and any("repeat" in w for w in rows[6]["warnings"]),
                 "handled cases are notes, texture tiling is a warning")
 
@@ -334,6 +335,15 @@ def main():
                     ref = pixels[0, x0, chans] * (1 - f) + pixels[0, x1, chans] * f
                     if np.abs(np.array(got) - ref).max() > 2:
                         mismatches.append((face.index, channel, got, tuple(np.round(ref, 1))))
+                    continue
+                if isinstance(want, tuple) and want and want[0] == "dir":
+                    pixels = want[1]
+                    th, tw = pixels.shape[:2]
+                    sx, sy = np.floor(src_uv * (tw, th)).astype(int)
+                    d = srgb_decode(pixels[sy % th, sx % tw, :3] / 255.0)
+                    ref = np.round((d / np.linalg.norm(d) * 0.5 + 0.5) * 255)
+                    if np.abs(np.array(got) - ref).max() > 1:
+                        mismatches.append((face.index, channel, got, tuple(ref)))
                     continue
                 if isinstance(want, tuple) and want and want[0] == "map":
                     _, pixels, chans, fn = want
