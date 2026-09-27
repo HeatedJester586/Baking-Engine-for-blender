@@ -2,7 +2,9 @@
 
 A Blender add-on that combines **every material of a mesh into one material**
 with one set of square texture atlases: Base Color (+ Alpha), Roughness,
-Metallic, Normal, Emission and Height.
+Metallic, Normal, Emission and Height, plus every other Principled BSDF input
+the model uses (Subsurface, Specular, Anisotropic, Transmission, Coat, Sheen,
+Thin Film, IOR, Diffuse Roughness).
 
 No ray tracing and no re-unwrapping. The parts of each texture that the
 model actually uses are cut out and packed together **texel for texel**, so
@@ -15,6 +17,12 @@ the result looks like the original.
 - **Auto size.** Picks the smallest square atlas (1K, 2K, 4K, 8K, 16K) that
   keeps every texel.
 - **Only what is used.** Unused parts of textures take no space.
+- **Every Principled input.** An input only gets an atlas if some material
+  textures it or uses different values. If every material uses the same value,
+  it is simply set on the new material. Inputs nobody changed are skipped.
+  Single-value inputs share textures (three per texture), values outside 0-1
+  (IOR, thin film thickness...) are stored as a range and scaled back by the
+  material, and Coat Normal is handled like Normal.
 - **Deduplication.** Materials that are copies of each other are stored once,
   and flat-colour parts shrink to a tiny block.
 - **Copies what you see.** Reads the node setup the way Blender renders it:
