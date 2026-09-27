@@ -90,7 +90,7 @@ def build_scene():
         "whammy_base": noise(32), "whammy_rough": noise(32, gray=True),
         "whammy_metal": noise(32, gray=True), "whammy_normal": noise(32),
         "whammy_height": noise(32, gray=True), "knob_base": noise(32),
-        "knob_height": noise(32, gray=True),
+        "knob_height": noise(32, gray=True), "ramp_rough": noise(32, gray=True),
     }
     ramp = np.zeros((16, 16, 4), np.uint8)
     ramp[..., :3] = (np.arange(16) * 16)[None, :, None]  # smooth left-to-right gradient
@@ -116,6 +116,7 @@ def build_scene():
         "whammy_height": make_image("whammy_bar_Height", px["whammy_height"], True),
         "knob_base": make_image("knob_BaseColor", px["knob_base"], False),
         "knob_height": make_image("knob_Height", px["knob_height"], True),
+        "ramp_rough": make_image("metal-alum_Roughness", px["ramp_rough"], False),
     }
 
     wood, tree, bsdf = new_material("Wood")
@@ -173,6 +174,13 @@ def build_scene():
     output = next(n for n in tree.nodes if n.type == 'OUTPUT_MATERIAL')
     tree.links.new(disp.outputs["Displacement"], output.inputs["Displacement"])
 
+    ramped, tree, bsdf = new_material("MAT_ColorRamp")  # roughness through a Color Ramp
+    ramp = tree.nodes.new('ShaderNodeValToRGB')
+    ramp.color_ramp.elements[0].color = (0.8, 0.8, 0.8, 1.0)
+    ramp.color_ramp.elements[1].color = (0.1, 0.1, 0.1, 1.0)
+    tree.links.new(image_node(tree, img["ramp_rough"]).outputs["Color"], ramp.inputs["Fac"])
+    tree.links.new(ramp.outputs["Color"], bsdf.inputs["Roughness"])
+
     mesh = bpy.data.meshes.new("guitar")
     bm = bmesh.new()
     uv_layer = bm.loops.layers.uv.new("UVMap")
@@ -190,6 +198,7 @@ def build_scene():
         (8, square),
         (9, square),
         (10, square),
+        (11, square),
     ]
     for i, (mat_index, uvs) in enumerate(faces):
         x = i * 1.5
@@ -205,7 +214,8 @@ def build_scene():
 
     obj = bpy.data.objects.new("guitar.036", mesh)
     bpy.context.scene.collection.objects.link(obj)
-    for mat in (wood, keytar_a, keytar_b, strings, carbon, partial, tiled, None, mixed, whammy, knob):
+    for mat in (wood, keytar_a, keytar_b, strings, carbon, partial, tiled, None, mixed, whammy, knob,
+                ramped):
         mesh.materials.append(mat)
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
@@ -246,6 +256,7 @@ def build_scene():
     expect[10] = {"BaseColor": ("tex", px["knob_base"], [0, 1, 2], 1),
                   "Height": ("map", px["knob_height"], [0], lambda h: (h - 0.5) * 0.1 / scale + mid)}
     expect[0]["Height"] = int(round(mid * 255))
+    expect[11] = {"Roughness": ("map", px["ramp_rough"], [0], lambda h: 0.8 - 0.7 * h)}
     return obj, expect
 
 
@@ -274,6 +285,8 @@ def main():
                 and [i for i, r in enumerate(rows) if r["displacement"]] == [9, 10]
                 and ("Normal", "TEX_Guitar_02_Normal") in rows[9]["textures"],
                 "material checker lists textures, emission and displacement per slot")
+    ok &= check(not rows[9]["warnings"] and any("repeat" in w for w in rows[6]["warnings"]),
+                "handled cases are notes, texture tiling is a warning")
 
     old_uv = baker._uv_array(source.data, "UVMap").astype(np.float64)
     result = baker.build_atlas(source, max_size=2048, padding=PADDING, hide_source=False)
@@ -335,7 +348,7 @@ def main():
         print("      face %d %s: got %s want %s" % m)
 
     # UV islands are moved, never rescaled: texel density is unchanged.
-    textured = {0: 32, 1: 32, 2: 32, 4: 32, 5: 64, 6: 32, 8: 32, 9: 32, 10: 32}
+    textured = {0: 32, 1: 32, 2: 32, 4: 32, 5: 64, 6: 32, 8: 32, 9: 32, 10: 32, 11: 32}
     dens_ok = True
     for face in mesh.polygons:
         if face.material_index in textured:
@@ -345,11 +358,11 @@ def main():
             dens_ok &= abs(src_len - dst_len) < 1e-3
     ok &= check(dens_ok, "texel density preserved (UV islands not resized)")
 
-    ok &= check(result["groups"] == 10, f"duplicate materials merged ({result['groups']} unique of 11 slots)")
+    ok &= check(result["groups"] == 11, f"duplicate materials merged ({result['groups']} unique of 12 slots)")
     ok &= check(result["flat_chunks"] >= 2, f"flat-colour materials shrunk ({result['flat_chunks']} flat chunks)")
     ok &= check(size == 128, f"smallest atlas that fits was picked ({size} x {size}, "
                              f"{result['filled']:.0%} filled)")
-    ok &= check(len(source.data.uv_layers) == 8 and len(source.material_slots) == 11,
+    ok &= check(len(source.data.uv_layers) == 8 and len(source.material_slots) == 12,
                 "original object untouched")
     ok &= check(len(target.material_slots) == 1 and
                 [l.name for l in target.data.uv_layers] == [baker.ATLAS_UV_NAME],

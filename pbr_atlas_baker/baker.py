@@ -130,6 +130,10 @@ class ChannelSource:
         self.wrap = "REPEAT"
         self.strength = 1.0         # normal maps
         self.tangent_uv = None      # normal maps: UV map that defines tangents
+        # Color Ramp: grey = texture . ramp_input[0] * ramp_input[1] + ramp_input[2],
+        # colour = ramp(grey); mask / scale / offset then apply to that colour.
+        self.ramp = None            # (N, 4) lookup table over 0..1
+        self.ramp_input = None      # (weights, scale, offset) producing the grey
 
     @classmethod
     def from_image(cls, image):
@@ -173,9 +177,28 @@ class ChannelSource:
             self.select(_LUMINANCE)
         return self
 
+    def apply_ramp(self, lut):
+        """Feed the current (grey) value through a Color Ramp lookup table."""
+        if self.image is None:
+            x = min(max(self.offset[0], 0.0), 1.0)
+            self.offset = tuple(float(v) for v in _ramp_lookup(lut, np.array(x, np.float32)))
+            return self
+        if self.ramp is not None:  # ramp after ramp: fold into one table
+            grey = _apply_stage(self.ramp, self.mask, self.scale, self.offset)
+            lut = _ramp_lookup(lut, grey)
+            self.ramp = lut
+        else:
+            weights = self.mask or _LUMINANCE
+            self.ramp_input = (tuple(weights), self.scale[0], self.offset[0])
+            self.ramp = lut
+        self.mask = None
+        self.scale = (1.0, 1.0, 1.0, 1.0)
+        self.offset = (0.0, 0.0, 0.0, 0.0)
+        return self
+
     def simplify(self):
         """A texture multiplied by zero is just its offset."""
-        if self.image is not None and not any(self.scale[:3]):
+        if self.image is not None and self.ramp is None and not any(self.scale[:3]):
             self.image, self.mask = None, None
             self.offset = tuple(self.offset[:3]) + (1.0,)
         return self
@@ -187,9 +210,13 @@ class ChannelSource:
         if self.image is None:
             return ("const",) + r(self.offset[:3])
         affine = None if self.uv_affine is None else r(v for row in self.uv_affine for v in row)
+        ramp = None
+        if self.ramp is not None:
+            ramp = (hashlib.blake2b(np.ascontiguousarray(self.ramp), digest_size=8).hexdigest(),
+                    r(self.ramp_input[0]), r(self.ramp_input[1:]))
         return ("tex", texture_key(self.image), self.mask and r(self.mask), r(self.scale),
                 r(self.offset), self.uv_layer or default_uv, affine, self.wrap,
-                round(float(self.strength), 6), self.tangent_uv or default_uv)
+                round(float(self.strength), 6), self.tangent_uv or default_uv, ramp)
 
     def describe(self):
         if self.image is None:
@@ -209,6 +236,8 @@ class ChannelSource:
             pass
         if self.scale[:3] != (1.0, 1.0, 1.0) or any(self.offset[:3]):
             extras.append("math")
+        if self.ramp is not None:
+            extras.append("color ramp")
         if self.uv_layer:
             extras.append(f"uv '{self.uv_layer}'")
         if self.uv_affine is not None:
@@ -416,8 +445,10 @@ def _resolve(socket, warn, depth=0):
     if kind in ('RGB', 'VALUE'):
         return ChannelSource(out.default_value)
     if kind == 'VALTORGB':
-        warn(f"Color Ramp '{node.name}' is ignored; its input is passed through")
-        return _resolve(node.inputs["Fac"], warn, depth + 1)
+        lut = np.array([node.color_ramp.evaluate(float(x)) for x in np.linspace(0.0, 1.0, 1024)],
+                       np.float32)
+        src = _resolve(node.inputs["Fac"], warn, depth + 1).to_scalar().apply_ramp(lut)
+        return src.select_channel(3) if out.identifier == "Alpha" else src
     warn(f"'{node.name}' ({node.bl_idname}) is not supported; using the socket's default value")
     return ChannelSource(fallback)
 
@@ -448,7 +479,7 @@ def _resolve_normal(socket, warn, depth=0):
     src = _resolve(socket, warn, depth + 1)
     if src.image is not None:
         warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node; "
-             "it is used as a tangent-space normal map")
+             "it is used as a tangent-space normal map", note=True)
         return src
     warn(f"'{node.name}' ({node.bl_idname}) feeding Normal is not supported; using a flat normal")
     return flat
@@ -481,11 +512,11 @@ def _check_colorspace(channel, src, warn):
         return  # constants and alpha channels are never colour managed
     data = _is_data(src.image)
     if channel in _COLOR_CHANNELS and data:
-        warn(f"{channel} image '{src.image.name}' is set to Non-Color")
+        warn(f"{channel} image '{src.image.name}' is set to Non-Color", note=True)
     elif channel not in _COLOR_CHANNELS and channel != "Alpha" and not data:
         warn(f"{channel} image '{src.image.name}' is tagged "
              f"'{src.image.colorspace_settings.name}'; its raw values are used, like a game "
-             "engine would (the atlas is Non-Color)")
+             "engine would (the atlas is Non-Color)", note=True)
 
 
 def _resolve_displacement(material, warn):
@@ -524,11 +555,13 @@ def build_plan(obj):
     plan = []
     for slot in slots:
         material = slot.material if slot is not None else None
-        warnings = []
+        warnings, notes = [], []
 
-        def warn(msg, _w=warnings):
-            if msg not in _w:
-                _w.append(msg)
+        def warn(msg, note=False, _w=warnings, _n=notes):
+            """Problems go to warnings; things handled automatically go to notes."""
+            target = _n if note else _w
+            if msg not in target:
+                target.append(msg)
 
         bsdf = _surface_bsdf(material) if material is not None else None
         if material is None:
@@ -565,8 +598,35 @@ def build_plan(obj):
             _check_colorspace(channel, src, warn)
             sources[channel] = src
         plan.append({"material": material, "sources": sources, "warnings": warnings,
-                     "displacement": displacement})
+                     "notes": notes, "displacement": displacement})
+    _check_tiling(obj, plan)
     return plan
+
+
+def _check_tiling(obj, plan):
+    """Warn about materials whose UVs repeat their texture: the repeats have to
+    be stored side by side in the atlas, which can take a lot of room."""
+    mesh = obj.data
+    if not len(mesh.polygons):
+        return
+    loops = _MeshLoops(mesh)
+    face_slot = np.clip(loops.face_material, 0, len(plan) - 1)
+    for slot, entry in enumerate(plan):
+        textured = [s for s in entry["sources"].values() if s.image is not None]
+        faces = np.flatnonzero(face_slot == slot)
+        if not textured or not faces.size:
+            continue
+        src = max(textured, key=lambda s: s.image.size[0] * s.image.size[1])
+        idx, _ = loops.loops_of(faces)
+        affine = _affine2x3(src.uv_affine)
+        t = loops.uv(src.uv_layer)[idx] @ affine[:, :2].T + affine[:, 2]
+        span = t.max(axis=0) - t.min(axis=0)
+        if span.max() > 1.05:
+            w, h = src.image.size
+            entry["warnings"].append(
+                f"its UVs repeat '{src.image.name}' {span[0]:.1f} x {span[1]:.1f} times, so it "
+                f"needs about {int(span[0] * w)} x {int(span[1] * h)} px in the atlas "
+                "(it is shrunk if that does not fit)")
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +739,8 @@ def diagnose(obj):
             lines.append(f"    {channel:<10} {entry['sources'][channel].describe()}")
         for w in entry["warnings"]:
             lines.append(f"    ! {w}")
+        for n in entry["notes"]:
+            lines.append(f"    - {n}")
         total_warnings += len(entry["warnings"])
         lines.append("-" * 72)
     lines.append(f"{total_warnings} warning(s).")
@@ -795,6 +857,7 @@ class _Texture:
         digest = hashlib.blake2b(self.data, digest_size=16).hexdigest()
         self.key = (digest, width, height, self.is_float, self.srgb)
         self._mean = None
+        self._reduced = {}
 
     def linear(self, raw, decode=True):
         """Raw texels -> float32 values. ``decode`` turns sRGB colours into
@@ -814,19 +877,39 @@ class _Texture:
         ys = _wrap_index(np.arange(y0, y0 + h), self.height, wrap)
         return self.data[ys[:, None], xs[None, :]]
 
-    def bilinear(self, px, py, wrap, decode=True):
-        """Linear values at texel coordinates (texel centres sit at i + 0.5)."""
+    def reduced(self, k, decode):
+        """Linear values averaged over k x k texel blocks (like a mipmap level)."""
+        key = (k, decode)
+        if key not in self._reduced:
+            h, w = self.height // k * k, self.width // k * k
+            lin = self.linear(self.data[:h, :w], decode)
+            self._reduced[key] = lin.reshape(h // k, k, w // k, k, 4).mean(axis=(1, 3))
+        return self._reduced[key]
+
+    def bilinear(self, px, py, wrap, decode=True, k=1):
+        """Linear values at texel coordinates (texel centres sit at i + 0.5).
+        ``k`` > 1 samples a k-times smaller averaged copy, for shrinking
+        without aliasing."""
+        if k > 1:
+            data = self.reduced(k, decode)
+            height, width = data.shape[:2]
+            px, py = px / k, py / k
+
+            def lin(texels):
+                return texels
+        else:
+            data, height, width = self.data, self.height, self.width
+
+            def lin(texels):
+                return self.linear(texels, decode)
         x, y = px - 0.5, py - 0.5
         xf, yf = np.floor(x), np.floor(y)
         fx, fy = (x - xf)[..., None], (y - yf)[..., None]
         xi, yi = xf.astype(np.int64), yf.astype(np.int64)
-        x0, x1 = _wrap_index(xi, self.width, wrap), _wrap_index(xi + 1, self.width, wrap)
-        y0, y1 = _wrap_index(yi, self.height, wrap), _wrap_index(yi + 1, self.height, wrap)
-        def lin(texels):
-            return self.linear(texels, decode)
-
-        lower = lin(self.data[y0, x0]) * (1 - fx) + lin(self.data[y0, x1]) * fx
-        upper = lin(self.data[y1, x0]) * (1 - fx) + lin(self.data[y1, x1]) * fx
+        x0, x1 = _wrap_index(xi, width, wrap), _wrap_index(xi + 1, width, wrap)
+        y0, y1 = _wrap_index(yi, height, wrap), _wrap_index(yi + 1, height, wrap)
+        lower = lin(data[y0, x0]) * (1 - fx) + lin(data[y0, x1]) * fx
+        upper = lin(data[y1, x0]) * (1 - fx) + lin(data[y1, x1]) * fx
         return lower * (1 - fy) + upper * fy
 
     def mean(self, decode=True):
@@ -1086,8 +1169,25 @@ def _cut_chunks(group, loops, padding):
 # Chunk pixels
 # ---------------------------------------------------------------------------
 
+def _ramp_lookup(lut, x):
+    """Colour Ramp table lookup with linear interpolation: x (...) -> (..., 4)."""
+    pos = np.clip(x, 0.0, 1.0) * (len(lut) - 1)
+    i0 = np.minimum(np.floor(pos).astype(np.int64), len(lut) - 2)
+    f = (pos - i0)[..., None]
+    return lut[i0] * (1.0 - f) + lut[i0 + 1] * f
+
+
+def _apply_stage(linear, mask, scale, offset):
+    """Grey value of ``linear`` (..., 4) through one mask / scale / offset stage."""
+    weights = np.asarray(mask or _LUMINANCE, np.float32)
+    return (linear @ weights) * scale[0] + offset[0]
+
+
 def _apply(src, linear, kind):
-    """Channel selection and factor math on linear values."""
+    """Colour Ramp, channel selection and factor math on linear values."""
+    if src.ramp is not None:
+        weights, scale, offset = src.ramp_input
+        linear = _ramp_lookup(src.ramp, (linear @ np.asarray(weights, np.float32)) * scale + offset)
     if src.mask is not None:
         v = linear @ np.asarray(src.mask, np.float32)
         v = (v * src.scale[0] + src.offset[0])[..., None]
@@ -1114,7 +1214,7 @@ def _encode(values, kind, rotation=None, strength=1.0):
 def _verbatim_channels(src, tex, kind, rotation):
     """Texel channels that can be copied byte for byte, or None when a
     conversion is needed (colour space, factor math, normal strength...)."""
-    if tex.is_float:
+    if tex.is_float or src.ramp is not None:
         return None
     if src.mask is None:
         if tuple(src.scale[:3]) != (1.0, 1.0, 1.0) or any(src.offset[:3]):
@@ -1139,6 +1239,11 @@ def _resample(chunk, master, src, tex, decode):
     """Linear values of ``src`` on the chunk's atlas texels (bilinear)."""
     affine = _affine2x3(src.uv_affine)
     out = np.empty((chunk.ah, chunk.aw, 4), np.float32)
+    # Source texels per atlas texel; shrink with an averaged copy to avoid aliasing.
+    ratio = abs(np.linalg.det(affine[:, :2] @ np.linalg.inv(master.affine[:, :2])))
+    footprint = math.sqrt(ratio * tex.width * tex.height / (master.width * master.height)) / chunk.scale
+    k = int(footprint) if footprint >= 2.0 else 1
+    k = max(1, min(k, tex.width, tex.height))
     xs = chunk.x0 + (np.arange(chunk.aw) + 0.5) / chunk.scale
     for row in range(0, chunk.ah, 256):
         ys = chunk.y0 + (np.arange(row, min(row + 256, chunk.ah)) + 0.5) / chunk.scale
@@ -1146,7 +1251,7 @@ def _resample(chunk, master, src, tex, decode):
         u, v = master.to_uv(px, py)
         tx = (affine[0, 0] * u + affine[0, 1] * v + affine[0, 2]) * tex.width
         ty = (affine[1, 0] * u + affine[1, 1] * v + affine[1, 2]) * tex.height
-        out[row:row + len(ys)] = tex.bilinear(tx, ty, src.wrap, decode)
+        out[row:row + len(ys)] = tex.bilinear(tx, ty, src.wrap, decode, k)
     return out
 
 
@@ -1395,6 +1500,8 @@ def _emission_peak(src, cache):
         return max(src.offset[:3])
     tex = cache.get(src.image)
     top = float(tex.data[..., :3].max()) if tex.is_float else 1.0
+    if src.ramp is not None:
+        top = float(src.ramp[:, :3].max())
     return max(s * top + o for s, o in zip(src.scale[:3], src.offset[:3]))
 
 

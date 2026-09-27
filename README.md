@@ -34,9 +34,9 @@ repacked texel for texel**:
 - **Flat colours shrink for free.** A material or chunk that is one solid
   colour becomes a tiny block, which loses nothing.
 - **Understands real-world node trees.** Channel-packed ORM textures
-  (Separate Color R/G/B), Mapping nodes (tiling), UV Map nodes, the glTF
-  importer's Mix/Math "factor" nodes, Invert, Normal Map strength,
-  reroutes and muted nodes.
+  (Separate Color R/G/B), Color Ramps (evaluated exactly), Mapping nodes
+  (tiling), UV Map nodes, the glTF importer's Mix/Math "factor" nodes,
+  Invert, Normal Map strength, reroutes and muted nodes.
 - **Correct colour.** Base Color and Emission atlases are sRGB, data maps
   are Non-Color. Roughness, Metallic and Normal textures are always read
   as raw values (like a game engine), even if they are tagged sRGB.
@@ -120,15 +120,16 @@ in the console:
   the Max Atlas Size, everything is scaled down evenly and a warning tells
   you by how much. Raise the maximum (16K) to avoid it.
 - **Heavily tiled textures:** a texture repeated 10× across a face needs 10×
-  its size in the atlas. If that is larger than the maximum, that part is
-  scaled down with a warning.
+  its size in the atlas. *Check Materials* warns about this in advance. If
+  it is larger than the maximum, that part is scaled down (averaged like a
+  mipmap, so it stays smooth) with a warning.
 - **Factor math, colour-space fixes and Normal Map strength** are applied
   to the texels, because the atlas has to look like the original material.
 
 ## Limitations
 
-- Only Principled BSDF inputs are read. Procedural textures, Color Ramps
-  and vertex colours are reported and approximated.
+- Only Principled BSDF inputs are read. Procedural textures and vertex
+  colours are reported and approximated.
 - Ambient occlusion, transmission, subsurface, clearcoat and sheen are not
   transferred.
 - UDIM (tiled) images are not supported.
