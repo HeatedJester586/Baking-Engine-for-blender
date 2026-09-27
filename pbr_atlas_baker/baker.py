@@ -604,11 +604,12 @@ def _prepare_target(source, angle_limit, island_margin, log):
     return target, default_uv
 
 
-def _output_dir(path, log):
-    path = path or "//atlas_textures/"
+def _output_dir(path):
+    """Folder for optional PNG copies; None = keep the textures in the .blend only."""
+    if not path:
+        return None
     if path.startswith("//") and not bpy.data.filepath:
-        path = os.path.join(os.path.expanduser("~"), "pbr_atlas_baker")
-        log(f"The .blend file is not saved yet, so textures go to {path}")
+        raise RuntimeError("Save the .blend file first, or choose a full folder path for the PNG files.")
     path = os.path.abspath(bpy.path.abspath(path))
     os.makedirs(path, exist_ok=True)
     return path
@@ -624,10 +625,16 @@ def _set_colorspace(image, is_color):
             continue
 
 
-def _write_image(image, path, pack):
-    """Save ``image`` as PNG and turn it into a normal file-backed image."""
-    image.filepath_raw = path
+def _store_image(image, out_dir):
+    """Pack ``image`` into the .blend as a PNG. When ``out_dir`` is set, also
+    write a PNG copy there. Returns the copy's path, or None."""
     image.file_format = 'PNG'
+    if out_dir is None:
+        image.filepath_raw = f"//{image.name}.png"  # only names the packed file
+        image.pack()
+        return None
+    path = os.path.join(out_dir, image.name + ".png")
+    image.filepath_raw = path
     image.save()
     image.source = 'FILE'
     try:
@@ -635,9 +642,8 @@ def _write_image(image, path, pack):
     except ValueError:  # different drive on Windows
         image.filepath = path
     image.reload()
-    if pack:
-        image.pack()
-    return image
+    image.pack()
+    return path
 
 
 def _finalize_target(target, images, hide_source, source):
@@ -1002,15 +1008,16 @@ def _pad(pixels, fill_idx, background):
 
 
 def bake_gpu_atlas(source, resolution=4096, margin=16, angle_limit=math.radians(66.0),
-                   island_margin=0.005, output_dir="//atlas_textures/", pack_images=False,
-                   hide_source=True, log=print):
+                   island_margin=0.005, output_dir=None, hide_source=True, log=print):
     """Rasterise every material of ``source`` into four PBR atlases.
 
-    Returns a dict with the new object, the image paths and statistics.
+    The atlases are packed into the .blend; ``output_dir`` optionally also
+    writes PNG copies. Returns a dict with the new object, the images, the
+    PNG paths (if any) and statistics.
     """
     t_start = time.time()
     _check_source(source)
-    out_dir = _output_dir(output_dir, log)
+    out_dir = _output_dir(output_dir)
 
     plan = build_plan(source)
     warning_count = 0
@@ -1048,15 +1055,16 @@ def bake_gpu_atlas(source, resolution=4096, margin=16, angle_limit=math.radians(
         image = bpy.data.images.new(name, resolution, resolution, alpha=False)
         _set_colorspace(image, channel == "BaseColor")
         image.pixels.foreach_set((pixels.astype(np.float32) * (1.0 / 255.0)).ravel())
-        path = os.path.join(out_dir, name + ".png")
-        images[channel] = _write_image(image, path, pack_images)
-        paths[channel] = path
-        log(f"  saved {path}")
+        path = _store_image(image, out_dir)
+        images[channel] = image
+        if path:
+            paths[channel] = path
+            log(f"  saved {path}")
 
     _finalize_target(target, images, hide_source, source)
     seconds = time.time() - t_start
     log(f"Done in {seconds:.1f} s -> '{target.name}'")
-    return {"object": target, "paths": paths, "coverage": coverage,
+    return {"object": target, "images": images, "paths": paths, "coverage": coverage,
             "warnings": warning_count, "seconds": seconds}
 
 
@@ -1112,8 +1120,8 @@ def _bake_setup(materials, image, socket_name, default):
 
 
 def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radians(66.0),
-                      island_margin=0.005, output_dir="//atlas_textures/", samples=8,
-                      clear_custom_normals=True, pack_images=False, hide_source=True, log=print):
+                      island_margin=0.005, output_dir=None, samples=8,
+                      clear_custom_normals=True, hide_source=True, log=print):
     """Native Cycles surface bake of the same four atlases.
 
     Base Color, Roughness and Metallic are baked through an Emission shader,
@@ -1122,7 +1130,7 @@ def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radia
     """
     t_start = time.time()
     _check_source(source)
-    out_dir = _output_dir(output_dir, log)
+    out_dir = _output_dir(output_dir)
 
     target, default_uv = _prepare_target(source, angle_limit, island_margin, log)
     mesh = target.data
@@ -1174,10 +1182,11 @@ def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radia
                     use_selected_to_active=False,  # surface bake: no rays between objects
                     margin=margin, margin_type='EXTEND', use_clear=True,
                     target='IMAGE_TEXTURES', uv_layer=BAKE_UV_NAME, normal_space='TANGENT')
-            path = os.path.join(out_dir, name + ".png")
-            images[channel] = _write_image(image, path, pack_images)
-            paths[channel] = path
-            log(f"  saved {path}")
+            path = _store_image(image, out_dir)
+            images[channel] = image
+            if path:
+                paths[channel] = path
+                log(f"  saved {path}")
     finally:
         scene.render.engine, scene.cycles.samples, scene.cycles.device = saved
 
@@ -1187,7 +1196,8 @@ def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radia
             bpy.data.materials.remove(temp)
     seconds = time.time() - t_start
     log(f"Done in {seconds:.1f} s -> '{target.name}'")
-    return {"object": target, "paths": paths, "coverage": None, "warnings": 0, "seconds": seconds}
+    return {"object": target, "images": images, "paths": paths, "coverage": None,
+            "warnings": 0, "seconds": seconds}
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1211,8 @@ if __name__ == "__main__":
     MARGIN = 16                        # edge padding in pixels
     ANGLE_LIMIT_DEGREES = 66.0         # Smart UV Project angle limit
     ISLAND_MARGIN = 0.005              # space between UV islands (0..1 UV units)
-    OUTPUT_DIR = "//atlas_textures/"   # "//" = next to the .blend file
+    OUTPUT_DIR = None                  # None = textures only inside the .blend;
+                                       # or a folder for PNG copies, e.g. "//atlas_textures/"
     DIAGNOSE_ONLY = False              # True = only write the report
 
     source_obj = bpy.data.objects.get(OBJECT_NAME) if OBJECT_NAME else bpy.context.active_object

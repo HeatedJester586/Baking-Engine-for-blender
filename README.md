@@ -48,25 +48,27 @@ Requires **Blender 4.2 or newer**. The automated tests run on Blender 5.0.
 
 ## Usage
 
-1. Save your `.blend` file (textures are written next to it by default).
-2. Select the mesh (for example `guitar.036`) in Object Mode.
-3. Open **Sidebar > Atlas** and click **Diagnose Materials**. Check the
+1. Select the mesh (for example `guitar.036`) in Object Mode.
+2. Open **Sidebar > Atlas** and click **Diagnose Materials**. Check the
    report in the Text Editor (`PBR_ATLAS_REPORT.txt`) and fix any warnings
    you care about, such as missing images.
-4. Pick a resolution and click **Bake Atlas**.
+3. Pick a resolution and click **Bake Atlas**.
 
-You get a new object `<name>_ATLAS` with one UV map (`UV_Atlas`), one material
-(`M_<name>_ATLAS`) and four PNGs in the output folder:
+You get a new object `<name>_ATLAS` with one UV map (`UV_Atlas`) and one
+material (`M_<name>_ATLAS`) whose Principled BSDF uses four new textures:
 
-```
-atlas_textures/
-  guitar.036_ATLAS_BaseColor_4096.png   (sRGB)
-  guitar.036_ATLAS_Roughness_4096.png   (Non-Color)
-  guitar.036_ATLAS_Metallic_4096.png    (Non-Color)
-  guitar.036_ATLAS_Normal_4096.png      (Non-Color, OpenGL / +Y)
-```
+| Texture | Colour space | Plugged into |
+|---|---|---|
+| `<name>_ATLAS_BaseColor_<res>` | sRGB | Base Color |
+| `<name>_ATLAS_Roughness_<res>` | Non-Color | Roughness |
+| `<name>_ATLAS_Metallic_<res>` | Non-Color | Metallic |
+| `<name>_ATLAS_Normal_<res>` | Non-Color, OpenGL (+Y) | Normal Map > Normal |
 
-Baking again replaces the previous `_ATLAS` object and images.
+The textures are stored **inside the .blend file**; nothing is written to
+disk unless you tick **Also Save PNG Files**. To export them later, use
+*Image > Save As* in the Image Editor or *File > External Data > Unpack Resources*.
+
+Baking again replaces the previous `_ATLAS` object and textures.
 
 ### Running it as a script
 
@@ -83,9 +85,8 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 | Edge Padding | 16 px | How far each UV island is extended outwards. |
 | Angle Limit | 66° | Smart UV Project angle limit for the new UVs. |
 | Island Margin | 0.005 | Space between UV islands. |
-| Output Folder | `//atlas_textures/` | `//` means next to the `.blend` file. |
-| Pack into .blend | off | Also embed the PNGs in the `.blend`. |
 | Hide Original | on | Hides the source object afterwards. |
+| Also Save PNG Files | off | Also write the textures as PNGs to **Folder** (`//` = next to the `.blend`). |
 | Samples (Cycles) | 8 | Only for anti-aliasing; no lighting is baked. |
 | Clear Custom Normals (Cycles) | on | Works around black normal bakes on meshes with custom split normals. |
 
@@ -112,7 +113,7 @@ example a procedural texture or a Color Ramp), use the Cycles method.
    their atlas UV position, sampling the source texture at the original UV
    through a custom shader. The shader handles channel selection, the
    factor math, wrap mode, sRGB output and the normal-map tangent rotation.
-   The result is read back, padded and saved.
+   The result is read back, padded and packed into the .blend.
    **Cycles:** an image node is added to every material and each channel is
    baked onto the surface itself.
 4. All old UV maps and slots on the copy are replaced by one master material

@@ -37,13 +37,14 @@ class PBRAtlasSettings(bpy.types.PropertyGroup):
         name="Island Margin", default=0.005, min=0.0, max=0.1, precision=4,
         description="Space between UV islands in the atlas (UV units)",
     )
-    output_dir: StringProperty(
-        name="Output Folder", subtype='DIR_PATH', default="//atlas_textures/",
-        description="Where the PNG atlases are written ('//' = next to the .blend file)",
+    save_files: BoolProperty(
+        name="Also Save PNG Files", default=False,
+        description="The atlases are always stored inside the .blend. Enable this to also "
+                    "write them to a folder as PNG files",
     )
-    pack_images: BoolProperty(
-        name="Pack into .blend", default=False,
-        description="Also pack the atlases into the .blend file",
+    output_dir: StringProperty(
+        name="Folder", subtype='DIR_PATH', default="//atlas_textures/",
+        description="Where the PNG copies are written ('//' = next to the .blend file)",
     )
     hide_source: BoolProperty(
         name="Hide Original", default=True,
@@ -106,8 +107,7 @@ class PBRATLAS_OT_bake(bpy.types.Operator):
             margin=settings.margin,
             angle_limit=settings.angle_limit,
             island_margin=settings.island_margin,
-            output_dir=settings.output_dir,
-            pack_images=settings.pack_images,
+            output_dir=settings.output_dir if settings.save_files else None,
             hide_source=settings.hide_source,
             log=lambda msg: print("[PBR Atlas]", msg),
         )
@@ -161,9 +161,10 @@ class PBRATLAS_PT_panel(bpy.types.Panel):
             col.prop(settings, "samples")
             col.prop(settings, "clear_custom_normals")
 
-        layout.prop(settings, "output_dir")
-        layout.prop(settings, "pack_images")
         layout.prop(settings, "hide_source")
+        layout.prop(settings, "save_files")
+        if settings.save_files:
+            layout.prop(settings, "output_dir")
 
         layout.separator()
         layout.operator(PBRATLAS_OT_diagnose.bl_idname, icon='VIEWZOOM')

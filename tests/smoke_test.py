@@ -213,6 +213,35 @@ def main():
         ok &= check(median <= 1.0 and mean <= 6.0,
                     f"{ch:<10} GPU vs Cycles: median {median:.2f}, mean {mean:.2f} (8-bit levels)")
 
+    # Default mode: textures live only inside the .blend, wired into the BSDF.
+    files_before = sorted(os.walk(TMP))
+    packed = baker.bake_gpu_atlas(source, resolution=RES, margin=4, hide_source=False)
+    images = packed["images"]
+    ok &= check(not packed["paths"] and sorted(os.walk(TMP)) == files_before,
+                "default bake writes no files to disk")
+    ok &= check(all(img.packed_file is not None for img in images.values()),
+                "atlases are packed into the .blend")
+    mat = packed["object"].material_slots[0].material
+    bsdf = next(n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+    feeds = {name: bsdf.inputs[name].links[0].from_node
+             for name in ("Base Color", "Roughness", "Metallic", "Normal")}
+    ok &= check(feeds["Base Color"].image == images["BaseColor"]
+                and feeds["Roughness"].image == images["Roughness"]
+                and feeds["Metallic"].image == images["Metallic"]
+                and feeds["Normal"].inputs["Color"].links[0].from_node.image == images["Normal"],
+                "atlases are plugged into the Principled BSDF")
+
+    blend = os.path.join(TMP, "reopen_test.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=blend)
+    bpy.ops.wm.open_mainfile(filepath=blend)
+    same = True
+    for ch in baker.CHANNELS:
+        img = bpy.data.images[f"guitar.036_ATLAS_{ch}_{RES}"]
+        arr = np.empty(RES * RES * 4, np.float32)
+        img.pixels.foreach_get(arr)
+        same &= np.abs(arr.reshape(RES, RES, 4) - gpu[ch]).max() < 1.0 / 255.0
+    ok &= check(same, "packed atlases survive save + reopen unchanged")
+
     print("\nALL CHECKS PASSED" if ok else "\nSOME CHECKS FAILED")
     print("Output:", TMP)
     return ok

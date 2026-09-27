@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pbr_atlas_baker"
-version = "1.0.1"
+version = "1.0.2"
 name = "PBR Atlas Baker"
 tagline = "Merge every material of a mesh into one set of PBR atlases"
 maintainer = "HeatedJester586"
