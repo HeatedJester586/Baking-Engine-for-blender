@@ -42,6 +42,7 @@ ATLAS_UV_NAME = "UV_Atlas"
 TARGET_SUFFIX = "_ATLAS"
 MARKER = "pbr_atlas_baker"  # custom property set on objects this tool creates
 REPORT_TEXT = "PBR_ATLAS_REPORT.txt"
+LOG_TEXT = "PBR_ATLAS_BUILD_LOG.txt"
 
 _SOCKETS = {
     "BaseColor": ("Base Color",),
@@ -980,6 +981,7 @@ class _Master:
         self.texture = texture
         self.width, self.height = texture.width, texture.height
         self.uv_layer, self.affine, self.wrap = uv_layer, affine, wrap
+        self.texture_name = ""
         self._inverse = np.linalg.inv(affine[:, :2])
 
     def to_texels(self, uv):
@@ -1064,7 +1066,9 @@ def _pick_master(group, cache, default_uv, warn):
     if abs(np.linalg.det(affine[:, :2])) < 1e-12:
         warn(f"a Mapping node on '{src.image.name}' collapses the UVs; it is ignored")
         affine = _affine2x3(None)
-    return _Master(tex, src.uv_layer or default_uv, affine, src.wrap)
+    master = _Master(tex, src.uv_layer or default_uv, affine, src.wrap)
+    master.texture_name = src.image.name
+    return master
 
 
 def _normal_rotation(group, default_uv, warn):
@@ -1536,6 +1540,39 @@ def _room_report(groups, plan, size_limit):
     return "\n".join(lines)
 
 
+def _group_details(groups, plan):
+    """Per-material summary of what the packer did, for the build log."""
+    lines = ["", "Per material:"]
+    for g in groups:
+        names = ", ".join(sorted({plan[s]["material"].name for s in g.slots
+                                  if plan[s]["material"] is not None})) or "<empty slot>"
+        lines.append(f"- {names}")
+        if g.master is None:
+            lines.append("    flat colour -> one small block")
+            continue
+        m = g.master
+        lo, hi = g.loop_texel.min(axis=0), g.loop_texel.max(axis=0)
+        span = (hi - lo) / (m.width, m.height)
+        stored = sum(c.aw * c.ah for c in g.chunks)
+        scales = [c.scale for c in g.chunks if c.flat is None]
+        lines.append(f"    grid: '{m.texture_name}' {m.width}x{m.height}, UV map '{m.uv_layer}'")
+        lines.append(f"    UVs cover {span[0]:.2f} x {span[1]:.2f} of the texture")
+        lines.append(f"    {len(g.chunks)} piece(s), {sum(c.flat is not None for c in g.chunks)} flat, "
+                     f"{stored / 1e6:.2f} M texels in the atlas")
+        if scales and min(scales) < 1.0:
+            lines.append(f"    SHRUNK: smallest piece scale {min(scales):.0%}")
+        for c in sorted(g.chunks, key=lambda c: -c.aw * c.ah)[:3]:
+            lines.append(f"      piece {c.w}x{c.h} texels at ({c.x0}, {c.y0}) -> "
+                         f"{c.aw}x{c.ah} at atlas ({c.ax}, {c.ay})")
+    return lines
+
+
+def _write_text(name, lines):
+    text = bpy.data.texts.get(name) or bpy.data.texts.new(name)
+    text.clear()
+    text.write("\n".join(lines))
+
+
 def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
                 lossless=True, raw_data=False, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
@@ -1548,6 +1585,13 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
 
     Returns a dict with the new object, its images and statistics.
     """
+    log_lines = []
+    user_log = log
+
+    def log(msg):
+        log_lines.append(msg)
+        user_log(msg)
+
     t_start = time.time()
     _check_source(source)
     if bpy.context.mode != 'OBJECT':
@@ -1639,7 +1683,9 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
     fits = all(max(c.aw, c.ah) <= max_size for c in chunks)
     size = _pack(chunks, max_size, warn, log, lossless) if fits else None
     if size is None:
-        raise RuntimeError(_room_report(groups, plan, max_size))
+        message = _room_report(groups, plan, max_size)
+        _write_text(LOG_TEXT, log_lines + ["", message] + _group_details(groups, plan))
+        raise RuntimeError(message)
     filled = sum(c.aw * c.ah for c in chunks) / float(size * size)
 
     # New UVs: every loop moves with its chunk; nothing is re-unwrapped.
@@ -1717,6 +1763,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
     flat_count = sum(c.flat is not None for c in chunks)
     log(f"Done in {seconds:.1f} s: {size} x {size} atlas, {len(chunks)} chunk(s) "
         f"({flat_count} flat), {filled:.0%} filled -> '{target.name}'")
+    _write_text(LOG_TEXT, log_lines + _group_details(groups, plan))
     return {"object": target, "images": images, "paths": paths, "size": size,
             "groups": len(groups), "chunks": len(chunks), "flat_chunks": flat_count,
             "filled": filled, "warnings": len(warnings), "seconds": seconds}
