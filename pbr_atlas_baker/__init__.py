@@ -9,11 +9,17 @@ from . import baker
 
 class PBRAtlasSettings(bpy.types.PropertyGroup):
     max_size: EnumProperty(
-        name="Max Atlas Size",
-        description="The smallest power-of-two size that holds every texture at full "
-                    "resolution is used, up to this size",
-        items=[(str(s), f"{s} x {s}", "") for s in (2048, 4096, 8192, 16384)],
-        default='8192',
+        name="Atlas Size",
+        description="Auto picks the smallest power-of-two size that holds every texture at "
+                    "full resolution. A number caps the size at that value",
+        items=[('AUTO', "Auto", "Smallest size that keeps every texel (up to 16384)")]
+              + [(str(s), f"Max {s} x {s}", "") for s in (2048, 4096, 8192, 16384)],
+        default='AUTO',
+    )
+    lossless: BoolProperty(
+        name="Lossless", default=True,
+        description="Never shrink textures. If they do not fit, stop and explain which "
+                    "materials need the room instead of lowering quality",
     )
     padding: IntProperty(
         name="Padding", subtype='PIXEL', default=8, min=0, max=64,
@@ -81,13 +87,15 @@ class PBRATLAS_OT_build(bpy.types.Operator):
         try:
             result = baker.build_atlas(
                 _active_mesh(context),
-                max_size=int(settings.max_size),
+                max_size=0 if settings.max_size == 'AUTO' else int(settings.max_size),
+                lossless=settings.lossless,
                 padding=settings.padding,
                 output_dir=settings.output_dir if settings.save_files else None,
                 hide_source=settings.hide_source,
                 log=lambda msg: print("[PBR Atlas]", msg),
             )
         except RuntimeError as exc:
+            print("[PBR Atlas]", exc)
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
@@ -119,6 +127,7 @@ class PBRATLAS_PT_panel(bpy.types.Panel):
             box.label(text=f"{len(obj.material_slots)} material slot(s)")
 
         layout.prop(settings, "max_size")
+        layout.prop(settings, "lossless")
         layout.prop(settings, "padding")
         layout.prop(settings, "hide_source")
         layout.prop(settings, "save_files")

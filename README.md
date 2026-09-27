@@ -102,7 +102,8 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 
 | Setting | Default | Notes |
 |---|---|---|
-| Max Atlas Size | 8192 | The smallest power of two that fits is used, up to this. |
+| Atlas Size | Auto | Auto picks the smallest power of two that keeps every texel (up to 16384). A number caps the size. |
+| Lossless | on | Never shrink anything. If the textures do not fit, stop and list which materials need the room. |
 | Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
 | Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |
@@ -116,9 +117,10 @@ in the console:
   with a 1K ORM): a face has only one UV, so the smaller texture is
   upscaled with bilinear filtering onto the larger one's grid. Nothing is
   lost, but those texels are interpolated, not copied.
-- **Too big for the maximum size:** if all chunks together do not fit in
-  the Max Atlas Size, everything is scaled down evenly and a warning tells
-  you by how much. Raise the maximum (16K) to avoid it.
+- **Too big for the maximum size** (only with *Lossless* off): if all chunks
+  together do not fit, everything is scaled down evenly and a warning tells
+  you by how much. With *Lossless* on, nothing is built and you get a list of
+  the materials that need the room instead.
 - **Heavily tiled textures:** a texture repeated 10× across a face needs 10×
   its size in the atlas. *Check Materials* warns about this in advance. If
   it is larger than the maximum, that part is scaled down (averaged like a

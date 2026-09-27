@@ -84,6 +84,7 @@ _BACKGROUND = {
     "Height": (0, 0, 0),  # replaced by the displacement midlevel
 }
 _ATLAS_SIZES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+AUTO_SIZE_LIMIT = 16384  # largest atlas "Auto" will build (GPU texture limit)
 _MISSING_TEXTURE = (1.0, 0.0, 1.0, 1.0)  # Blender's pink "missing image" colour
 _LUMINANCE = (0.2126, 0.7152, 0.0722, 0.0)  # Blender's implicit colour -> float
 _CHANNEL_OUTPUTS = {"Red": 0, "R": 0, "Green": 1, "G": 1, "Blue": 2, "B": 2, "Alpha": 3, "A": 3}
@@ -1379,8 +1380,9 @@ def _try_pack(chunks, size):
     return spots
 
 
-def _pack(chunks, max_size, warn, log):
-    """Place every chunk; returns the atlas size (smallest power of two that fits)."""
+def _pack(chunks, max_size, warn, log, lossless=False):
+    """Place every chunk; returns the atlas size (smallest power of two that
+    fits), or None in lossless mode when nothing up to ``max_size`` fits."""
     def place(spots):
         for chunk, (x, y) in zip(chunks, spots):
             chunk.ax, chunk.ay = x, y
@@ -1397,6 +1399,8 @@ def _pack(chunks, max_size, warn, log):
         if spots is not None:
             place(spots)
             return size
+    if lossless:
+        return None
 
     factor = min(1.0, math.sqrt(max_size * max_size / area))
     while True:
@@ -1505,8 +1509,36 @@ def _emission_peak(src, cache):
     return max(s * top + o for s, o in zip(src.scale[:3], src.offset[:3]))
 
 
-def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=True, log=print):
+def _room_report(groups, plan, size_limit):
+    """Error text for lossless mode: which materials need how much room."""
+    usage = []
+    for g in groups:
+        area = sum(c.w * c.h for c in g.chunks if c.flat is None)
+        widest = max((max(c.w, c.h) for c in g.chunks), default=0)
+        names = ", ".join(sorted({plan[s]["material"].name for s in g.slots
+                                  if plan[s]["material"] is not None})) or "<empty slot>"
+        usage.append((area, widest, names))
+    usage.sort(reverse=True)
+    total = sum(u[0] for u in usage)
+    widest_all = max((u[1] for u in usage), default=0)
+    needed = next((s for s in _ATLAS_SIZES + (32768, 65536)
+                   if s * s >= total and s >= widest_all), 65536)
+    lines = [f"Lossless: the textures do not fit in {size_limit} x {size_limit} "
+             f"(they need at least {needed} x {needed}). Biggest users:"]
+    for area, widest, names in usage[:5]:
+        lines.append(f"  {names}: {area / 1e6:.1f} M texels (largest piece {widest} px)")
+    lines.append("Turn off Lossless to shrink them to fit, raise Max Atlas Size, or reduce "
+                 "texture tiling on those materials.")
+    return "\n".join(lines)
+
+
+def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
+                lossless=True, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
+
+    ``max_size`` 0 means Auto: the smallest power of two that holds every
+    texel, up to AUTO_SIZE_LIMIT. With ``lossless`` nothing is ever scaled
+    down; if the textures do not fit, a RuntimeError explains why.
 
     Returns a dict with the new object, its images and statistics.
     """
@@ -1515,6 +1547,9 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
     if bpy.context.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
     out_dir = _output_dir(output_dir)
+    if not max_size:
+        max_size = AUTO_SIZE_LIMIT
+        log("Atlas size: Auto (smallest size that keeps every texel)")
 
     warnings = []
 
@@ -1581,7 +1616,7 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
         g.normal_rotation = _normal_rotation(g, loops.default_uv, warn)
         _cut_chunks(g, loops, padding)
         for chunk in g.chunks:
-            if max(chunk.w, chunk.h) > max_size:
+            if max(chunk.w, chunk.h) > max_size and not lossless:
                 chunk.base_scale = max_size / max(chunk.w, chunk.h)
                 chunk.rescale(chunk.base_scale)
                 names = ", ".join(sorted({plan[s]["material"].name for s in g.slots
@@ -1595,7 +1630,10 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
 
     chunks = [c for g in groups for c in g.chunks]
     log(f"Packing {len(chunks)} chunk(s)...")
-    size = _pack(chunks, max_size, warn, log)
+    fits = all(max(c.aw, c.ah) <= max_size for c in chunks)
+    size = _pack(chunks, max_size, warn, log, lossless) if fits else None
+    if size is None:
+        raise RuntimeError(_room_report(groups, plan, max_size))
     filled = sum(c.aw * c.ah for c in chunks) / float(size * size)
 
     # New UVs: every loop moves with its chunk; nothing is re-unwrapped.
@@ -1622,7 +1660,8 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
     # Build each atlas and compress it to PNG on worker threads (zlib runs in
     # parallel) while the next atlas is being assembled.
     jobs = []
-    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+    workers = 2 if size >= 16384 else 4  # 16K atlases take 1 GB each while compressing
+    with ThreadPoolExecutor(max_workers=min(workers, os.cpu_count() or 1)) as pool:
         for name, color, alpha in _OUTPUTS:
             if color not in channels:
                 continue
@@ -1683,7 +1722,8 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
 
 if __name__ == "__main__":
     OBJECT_NAME = ""        # "" = the active object, e.g. "guitar.036"
-    MAX_ATLAS_SIZE = 8192   # the smallest power of two that fits is used, up to this
+    MAX_ATLAS_SIZE = 0      # 0 = Auto; else the smallest power of two that fits, up to this
+    LOSSLESS = True         # never shrink textures; stop with an explanation instead
     PADDING = 8             # texels of real texture kept around every UV island
     OUTPUT_DIR = None       # None = textures only inside the .blend;
                             # or a folder for PNG copies, e.g. "//atlas_textures/"
@@ -1692,4 +1732,5 @@ if __name__ == "__main__":
     source_obj = bpy.data.objects.get(OBJECT_NAME) if OBJECT_NAME else bpy.context.active_object
     print(write_report(source_obj))
     if not DIAGNOSE_ONLY:
-        build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR)
+        build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR,
+                    lossless=LOSSLESS)
