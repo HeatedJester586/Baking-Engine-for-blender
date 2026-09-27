@@ -1,38 +1,50 @@
 # PBR Atlas Baker for Blender
 
-Merge **every material of a mesh into one set of PBR textures**: Base Color,
-Roughness, Metallic and Normal, packed into a single square atlas
-(1K to 8K) on a copy of the mesh that uses one master material.
+Combine **every material of a mesh into one material** with one set of
+square PBR texture atlases: Base Color (+ Alpha), Roughness, Metallic,
+Normal and Emission.
 
-It was built for imported game models (glTF/GLB rips) that come with dozens
-of material slots, channel-packed ORM textures and floating detail geometry
-(strings, bridges, knobs) that ruin ordinary "Selected to Active" bakes.
+No baking, no ray tracing, no re-unwrapping. The textures are **cut and
+repacked texel for texel**:
+
+1. The object is duplicated. The original is never touched.
+2. For every material, the add-on finds which parts of its textures the UVs
+   actually use (UV islands → texel rectangles, "chunks") and cuts exactly
+   those parts out of every channel.
+3. The chunks are packed as tightly as possible into one square atlas. The
+   **smallest power-of-two size that holds everything at full resolution**
+   is picked automatically (up to 8K or 16K).
+4. The UVs are only **moved**, never re-unwrapped or resized, so every face
+   still sees exactly the texels it saw before.
+5. All materials are replaced by one material with the atlases plugged into
+   its Principled BSDF. The atlases are stored inside the `.blend`.
 
 ![Blender 4.2+](https://img.shields.io/badge/Blender-4.2%2B-orange) ![GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
 
 ## Features
 
-- **GPU rasterizer (default).** Each source texture is copied directly into
-  the new UV layout on the graphics card. No rays are cast, so floating
-  geometry cannot spray black noise or shadows onto the surface underneath.
-- **Cycles surface bake (alternative).** A native Cycles bake of each surface
-  onto itself. Base Color, Roughness and Metallic go through an Emission
-  shader, so metal parts do not bake black.
+- **Lossless.** Texels are copied byte for byte. Nothing is resampled
+  unless it has to be (see below), and texel density is kept.
+- **Only what is used.** A material that uses a quarter of its 4K texture
+  only takes a quarter of the space in the atlas.
+- **Deduplication.** Materials with identical textures (for example
+  `MAT_Keytar.063` … `.074` whose images are copies of each other) are
+  detected by their pixel content and stored once. Overlapping or mirrored
+  UV islands share their texels too.
+- **Flat colours shrink for free.** A material or chunk that is one solid
+  colour becomes a tiny block, which loses nothing.
 - **Understands real-world node trees.** Channel-packed ORM textures
-  (Separate Color R/G/B), Mapping nodes (tiling), UV Map nodes, the
-  glTF importer's Mix/Math "factor" nodes, Invert, Normal Map strength, and
+  (Separate Color R/G/B), Mapping nodes (tiling), UV Map nodes, the glTF
+  importer's Mix/Math "factor" nodes, Invert, Normal Map strength,
   reroutes and muted nodes.
-- **Correct normal maps.** Tangent-space normals are rotated into the atlas
-  UVs' tangent frame, including mirrored islands. Plain copying gives wrong
-  lighting on every island that Smart UV Project rotated.
-- **Correct colour.** Base Color is written as sRGB; data maps as Non-Color.
-- **Edge padding** so mipmaps never pull in background colour, plus an edge
-  pass that keeps sub-pixel parts (strings, fret wires) from disappearing.
-- **Diagnostics report** that lists, for every slot, exactly which image and
-  channel each PBR input comes from, with warnings for missing files,
-  unsupported nodes and wrong colour spaces.
-- Keeps custom split normals on the GPU path. The original object is never
-  modified.
+- **Correct colour.** Base Color and Emission atlases are sRGB, data maps
+  are Non-Color, and the values match what Blender renders.
+- **Padding** of real neighbouring texels around every island, so
+  mipmaps do not bleed.
+- **Diagnostics report** that lists, for every slot, which image and channel
+  each input comes from, with warnings for missing files, unsupported nodes
+  and wrong colour spaces.
+- Keeps custom split normals and every other mesh attribute.
 
 ## Installation
 
@@ -43,114 +55,97 @@ Requires **Blender 4.2 or newer**. The automated tests run on Blender 5.0.
    (or build it yourself, see [Building the zip](#building-the-zip)).
 2. In Blender: **Edit > Preferences > Get Extensions**, open the drop-down
    menu (top right) and choose **Install from Disk...**, then pick the zip.
-   You can also drag the zip into the Blender window.
+   Installing a newer zip replaces the old version.
 3. The panel appears in the 3D Viewport sidebar (**N**) under the **Atlas** tab.
 
 ## Usage
 
-1. Select the mesh (for example `guitar.036`) in Object Mode.
-2. Open **Sidebar > Atlas** and click **Diagnose Materials**. Check the
-   report in the Text Editor (`PBR_ATLAS_REPORT.txt`) and fix any warnings
-   you care about, such as missing images.
-3. Pick a resolution and click **Bake Atlas**.
+1. Select the mesh (for example `guitar.036`).
+2. Optional: click **Diagnose Materials** and check the report in the Text
+   Editor (`PBR_ATLAS_REPORT.txt`).
+3. Click **Build Atlas**.
 
 You get a new object `<name>_ATLAS` with one UV map (`UV_Atlas`) and one
-material (`M_<name>_ATLAS`) whose Principled BSDF uses four new textures:
+material (`M_<name>_ATLAS`):
 
 | Texture | Colour space | Plugged into |
 |---|---|---|
-| `<name>_ATLAS_BaseColor_<res>` | sRGB | Base Color |
-| `<name>_ATLAS_Roughness_<res>` | Non-Color | Roughness |
-| `<name>_ATLAS_Metallic_<res>` | Non-Color | Metallic |
-| `<name>_ATLAS_Normal_<res>` | Non-Color, OpenGL (+Y) | Normal Map > Normal |
+| `<name>_ATLAS_BaseColor_<size>` | sRGB (alpha channel = Alpha, if any) | Base Color, Alpha |
+| `<name>_ATLAS_Roughness_<size>` | Non-Color | Roughness |
+| `<name>_ATLAS_Metallic_<size>` | Non-Color | Metallic |
+| `<name>_ATLAS_Normal_<size>` | Non-Color, OpenGL (+Y) | Normal Map > Normal |
+| `<name>_ATLAS_Emission_<size>` (only if something glows) | sRGB | Emission Color |
 
-The textures are stored **inside the .blend file**; nothing is written to
-disk unless you tick **Also Save PNG Files**. To export them later, use
-*Image > Save As* in the Image Editor or *File > External Data > Unpack Resources*.
-
-Baking again replaces the previous `_ATLAS` object and textures.
+Nothing is written to disk unless you tick **Also Save PNG Files**. To
+export later, use *Image > Save As* in the Image Editor or
+*File > External Data > Unpack Resources*. Building again replaces the
+previous `_ATLAS` object and textures.
 
 ### Running it as a script
 
 `pbr_atlas_baker/baker.py` also works without installing the add-on. Open it
 in Blender's **Text Editor**, change the settings at the bottom of the file
-(`OBJECT_NAME`, `METHOD`, `RESOLUTION`, ...) and press **Run Script**.
+(`OBJECT_NAME`, `MAX_ATLAS_SIZE`, `PADDING`, `OUTPUT_DIR`) and press
+**Run Script**.
 
 ### Settings
 
 | Setting | Default | Notes |
 |---|---|---|
-| Method | GPU Rasterizer | Use Cycles if you prefer a native bake (see below). |
-| Resolution | 4096 | 1024, 2048, 4096 or 8192. The atlas is always square. |
-| Edge Padding | 16 px | How far each UV island is extended outwards. |
-| Angle Limit | 66° | Smart UV Project angle limit for the new UVs. |
-| Island Margin | 0.005 | Space between UV islands. |
+| Max Atlas Size | 8192 | The smallest power of two that fits is used, up to this. |
+| Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
-| Also Save PNG Files | off | Also write the textures as PNGs to **Folder** (`//` = next to the `.blend`). |
-| Samples (Cycles) | 8 | Only for anti-aliasing; no lighting is baked. |
-| Clear Custom Normals (Cycles) | on | Works around black normal bakes on meshes with custom split normals. |
+| Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |
 
-### GPU or Cycles?
+## When texels are not copied 1:1
 
-| | GPU Rasterizer | Cycles Surface Bake |
-|---|---|---|
-| Speed | Fast (one GPU draw per channel) | Slower (one Cycles bake per channel) |
-| Floating geometry | Unaffected | Unaffected (no Selected to Active) |
-| Node support | Common setups (listed above) | Anything Cycles can render |
-| Custom split normals | Kept | Cleared on the copy (optional) |
+The tool only changes texels when there is no lossless option, and says so
+in the console:
 
-If the diagnostics report warns about an unsupported node that matters (for
-example a procedural texture or a Color Ramp), use the Cycles method.
-
-## How it works
-
-1. The object is duplicated (object and mesh data). Materials are shared,
-   never edited permanently.
-2. A new UV map `UV_Atlas` is created with **Smart UV Project**. The angle
-   limit is passed in *radians*; passing degrees silently collapses every UV
-   to (0, 0).
-3. **GPU:** for each channel, every material slot's triangles are drawn at
-   their atlas UV position, sampling the source texture at the original UV
-   through a custom shader. The shader handles channel selection, the
-   factor math, wrap mode, sRGB output and the normal-map tangent rotation.
-   The result is read back, padded and packed into the .blend.
-   **Cycles:** an image node is added to every material and each channel is
-   baked onto the surface itself.
-4. All old UV maps and slots on the copy are replaced by one master material
-   that uses the four atlases.
+- **Different resolutions in one material** (for example a 2K Base Color
+  with a 1K ORM): a face has only one UV, so the smaller texture is
+  upscaled with bilinear filtering onto the larger one's grid. Nothing is
+  lost, but those texels are interpolated, not copied.
+- **Too big for the maximum size:** if all chunks together do not fit in
+  the Max Atlas Size, everything is scaled down evenly and a warning tells
+  you by how much. Raise the maximum (16K) to avoid it.
+- **Heavily tiled textures:** a texture repeated 10× across a face needs 10×
+  its size in the atlas. If that is larger than the maximum, that part is
+  scaled down with a warning.
+- **Factor math, colour-space fixes and Normal Map strength** are applied
+  to the texels, because the atlas has to look like the original material.
 
 ## Limitations
 
-- The GPU method only reads Principled BSDF inputs. Procedural textures,
-  Color Ramps, vertex colours and non-trivial math are reported and
-  approximated. Use Cycles for those.
-- Alpha / opacity, emission and ambient occlusion are not baked yet.
+- Only Principled BSDF inputs are read. Procedural textures, Color Ramps
+  and vertex colours are reported and approximated.
+- Ambient occlusion, transmission, subsurface, clearcoat and sheen are not
+  transferred.
 - UDIM (tiled) images are not supported.
-- Normal maps are assumed to be OpenGL style (+Y), which is Blender's and
-  glTF's convention.
-- Tiny parts get few pixels in the atlas, because Smart UV Project sizes
-  islands by surface area. Use a higher resolution if thin parts look blurry.
+- Normal maps are assumed to be OpenGL style (+Y), Blender's and glTF's
+  convention.
+- Atlas sizes are powers of two, so the atlas can be up to 4× larger than
+  the texels it holds. The fill percentage is printed after every build.
 
 ## Troubleshooting
 
 - **Pink areas:** a source image could not be loaded. The diagnostics report
   names the file. Use *File > External Data > Find Missing Files*.
-- **"GPU readback check failed":** the GPU backend could not draw. Try another
-  backend in *Preferences > System*, or use the Cycles method.
 - **Roughness/Metallic look too dark or too glossy:** the report warns when a
   data texture is tagged sRGB. Blender renders it that way too; set the
   source image to Non-Color if that is wrong.
-- **Nothing happens / errors:** open *Window > Toggle System Console* to see
-  the `[PBR Atlas]` log.
+- **Warnings:** open *Window > Toggle System Console* to see the
+  `[PBR Atlas]` log.
 
 ## Development
 
 ### Tests
 
-`tests/smoke_test.py` builds a small multi-material mesh covering ORM
-packing, metal, tiling, rotated and mirrored normal-mapped islands, floating
-geometry and an empty slot. It bakes the mesh with both methods and checks
-that the GPU result matches the Cycles result.
+`tests/smoke_test.py` builds a mesh with random-noise textures covering ORM
+packing, duplicated materials, partly used textures, tiling, a rotated
+normal-mapped island, alpha, emission, flat materials, an empty slot and 8
+UV maps. It then checks that every face samples exactly its original texels
+through the new UVs.
 
 ```bash
 blender -b --factory-startup --python tests/smoke_test.py

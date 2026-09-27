@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "pbr_atlas_baker"
-version = "1.0.2"
+version = "1.1.0"
 name = "PBR Atlas Baker"
-tagline = "Merge every material of a mesh into one set of PBR atlases"
+tagline = "Repack all materials of a mesh into one lossless PBR atlas"
 maintainer = "HeatedJester586"
 type = "add-on"
 website = "https://github.com/HeatedJester586/Baking-Engine-for-blender"

@@ -1,63 +1,89 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-PBR Atlas Baker - core pipeline.
+PBR Atlas Baker - texture repacking engine.
 
-Merges every material slot of a mesh into ONE set of PBR texture atlases
-(Base Color, Roughness, Metallic, Normal) on a duplicate of the mesh that
-carries a single master material.
+Combines every material of a mesh into ONE material with one set of texture
+atlases. Nothing is baked or ray traced and nothing is re-unwrapped:
 
-Two methods are available:
+1. The object is duplicated; the original is never modified.
+2. For every material, the parts of its textures that the UVs actually use
+   are found (UV islands -> texel rectangles called "chunks") and cut out of
+   every channel: Base Color, Alpha, Roughness, Metallic, Normal, Emission.
+3. The chunks are packed as tightly as possible into one square atlas. The
+   smallest power-of-two size that holds them is picked automatically, up
+   to a maximum. Chunks are copied texel for texel, so nothing is resampled.
+4. The UVs are only moved (never rescaled) so every face points at its
+   chunk, all materials are replaced by one material, and the atlases are
+   stored inside the .blend.
 
-* GPU    - rasterises every source texture straight into the new UV layout
-           on the graphics card. No rays are cast, so floating geometry
-           (strings, bridges, knobs) can never shadow or occlude the body.
-* CYCLES - native Cycles surface bake (never "Selected to Active").
+A chunk is only made smaller when that loses nothing (the chunk is a single
+flat colour) or, with a warning, when the atlas would otherwise be larger
+than the maximum size.
 
 The add-on UI imports this module, but the file also runs on its own:
-open it in Blender's Text Editor, edit the settings at the bottom and
-press "Run Script".
+open it in Blender's Text Editor, edit the settings at the bottom and press
+"Run Script".
 """
 
+import hashlib
 import math
 import os
+import struct
 import time
-from contextlib import contextmanager
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import bpy
 import numpy as np
 from mathutils import Euler, Matrix, Vector
 
-CHANNELS = ("BaseColor", "Roughness", "Metallic", "Normal")
-BAKE_UV_NAME = "UV_Atlas"
+CHANNELS = ("BaseColor", "Alpha", "Roughness", "Metallic", "Normal", "Emission")
+ATLAS_UV_NAME = "UV_Atlas"
 TARGET_SUFFIX = "_ATLAS"
 MARKER = "pbr_atlas_baker"  # custom property set on objects this tool creates
 REPORT_TEXT = "PBR_ATLAS_REPORT.txt"
 
 _SOCKETS = {
-    "BaseColor": "Base Color",
-    "Roughness": "Roughness",
-    "Metallic": "Metallic",
-    "Normal": "Normal",
+    "BaseColor": ("Base Color",),
+    "Alpha": ("Alpha",),
+    "Roughness": ("Roughness",),
+    "Metallic": ("Metallic",),
+    "Emission": ("Emission Color", "Emission"),
 }
 # Values used when a slot has no material / no Principled BSDF (linear).
 _DEFAULTS = {
     "BaseColor": (0.8, 0.8, 0.8, 1.0),
+    "Alpha": (1.0, 1.0, 1.0, 1.0),
     "Roughness": (0.5, 0.5, 0.5, 1.0),
     "Metallic": (0.0, 0.0, 0.0, 1.0),
     "Normal": (0.5, 0.5, 1.0, 1.0),
+    "Emission": (0.0, 0.0, 0.0, 1.0),
 }
-# 8-bit fill for atlas pixels that no UV island reaches, even after padding.
+_SCALAR_CHANNELS = ("Alpha", "Roughness", "Metallic")
+_COLOR_CHANNELS = ("BaseColor", "Emission")
+# How each channel is stored in its atlas.
+_KIND = {"BaseColor": "srgb", "Emission": "srgb", "Normal": "normal",
+         "Alpha": "linear", "Roughness": "linear", "Metallic": "linear"}
+# Atlas textures: (name, channel for RGB, channel for alpha)
+_OUTPUTS = (
+    ("BaseColor", "BaseColor", "Alpha"),
+    ("Roughness", "Roughness", None),
+    ("Metallic", "Metallic", None),
+    ("Normal", "Normal", None),
+    ("Emission", "Emission", None),
+)
+# 8-bit fill for atlas texels that no chunk covers.
 _BACKGROUND = {
     "BaseColor": (128, 128, 128),
     "Roughness": (128, 128, 128),
     "Metallic": (0, 0, 0),
     "Normal": (128, 128, 255),
+    "Emission": (0, 0, 0),
 }
+_ATLAS_SIZES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 _MISSING_TEXTURE = (1.0, 0.0, 1.0, 1.0)  # Blender's pink "missing image" colour
 _LUMINANCE = (0.2126, 0.7152, 0.0722, 0.0)  # Blender's implicit colour -> float
 _CHANNEL_OUTPUTS = {"Red": 0, "R": 0, "Green": 1, "G": 1, "Blue": 2, "B": 2, "Alpha": 3, "A": 3}
-_WRAP_MODES = {"REPEAT": 0, "EXTEND": 1, "CLIP": 1, "MIRROR": 2}
-_EDGE_ORDER = (0, 1, 1, 2, 2, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +169,24 @@ class ChannelSource:
         if self.image is None or self.mask is None:
             self.select(_LUMINANCE)
         return self
+
+    def simplify(self):
+        """A texture multiplied by zero is just its offset."""
+        if self.image is not None and not any(self.scale[:3]):
+            self.image, self.mask = None, None
+            self.offset = tuple(self.offset[:3]) + (1.0,)
+        return self
+
+    def key(self, texture_key, default_uv):
+        """Hashable description: equal keys produce identical texels."""
+        def r(values):
+            return tuple(round(float(v), 6) for v in values)
+        if self.image is None:
+            return ("const",) + r(self.offset[:3])
+        affine = None if self.uv_affine is None else r(v for row in self.uv_affine for v in row)
+        return ("tex", texture_key(self.image), self.mask and r(self.mask), r(self.scale),
+                r(self.offset), self.uv_layer or default_uv, affine, self.wrap,
+                round(float(self.strength), 6), self.tangent_uv or default_uv)
 
     def describe(self):
         if self.image is None:
@@ -417,6 +461,23 @@ def _surface_bsdf(material):
     return next((n for n in tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
 
 
+
+def _bsdf_input(bsdf, channel):
+    return next((bsdf.inputs.get(n) for n in _SOCKETS[channel] if bsdf.inputs.get(n)), None)
+
+
+def _check_colorspace(channel, src, warn):
+    if src.image is None or (src.mask is not None and not any(src.mask[:3])):
+        return  # constants and alpha channels are never colour managed
+    data = _is_data(src.image)
+    if channel in _COLOR_CHANNELS and data:
+        warn(f"{channel} image '{src.image.name}' is set to Non-Color")
+    elif channel not in _COLOR_CHANNELS and channel != "Alpha" and not data:
+        warn(f"{channel} image '{src.image.name}' uses the "
+             f"'{src.image.colorspace_settings.name}' colour space, so Blender "
+             "gamma-decodes it; set it to Non-Color if it holds raw data")
+
+
 def build_plan(obj):
     """Work out, for every material slot, where each PBR channel comes from.
 
@@ -451,36 +512,26 @@ def build_plan(obj):
             elif channel == "Normal":
                 src = _resolve_normal(bsdf.inputs["Normal"], warn)
             else:
-                src = _resolve(bsdf.inputs[_SOCKETS[channel]], warn)
-                if channel != "BaseColor":
+                socket = _bsdf_input(bsdf, channel)
+                src = _resolve(socket, warn) if socket is not None else ChannelSource(_DEFAULTS[channel])
+                if channel in _SCALAR_CHANNELS:
                     src.to_scalar()
-            if src.image is not None:
-                data = _is_data(src.image)
-                if channel == "BaseColor" and data:
-                    warn(f"Base Color image '{src.image.name}' is set to Non-Color")
-                elif channel != "BaseColor" and not data:
-                    warn(f"{channel} image '{src.image.name}' uses the "
-                         f"'{src.image.colorspace_settings.name}' colour space, so Blender "
-                         "gamma-decodes it; set it to Non-Color if it holds raw data")
+                if channel == "Emission":
+                    strength = bsdf.inputs.get("Emission Strength")
+                    if strength is not None and strength.is_linked:
+                        warn("Emission Strength is linked; assuming 1.0")
+                    elif strength is not None:
+                        src.affine(strength.default_value)
+            src.simplify()
+            _check_colorspace(channel, src, warn)
             sources[channel] = src
         plan.append({"material": material, "sources": sources, "warnings": warnings})
     return plan
 
 
 # ---------------------------------------------------------------------------
-# Mesh helpers
+# Mesh and file helpers
 # ---------------------------------------------------------------------------
-
-def _triangles(mesh):
-    mesh.calc_loop_triangles()
-    tris = mesh.loop_triangles
-    count = len(tris)
-    loops = np.empty(count * 3, np.int32)
-    mats = np.empty(count, np.int32)
-    tris.foreach_get("loops", loops)
-    tris.foreach_get("material_index", mats)
-    return loops.reshape(count, 3), mats
-
 
 def _uv_array(mesh, name):
     arr = np.zeros(len(mesh.loops) * 2, np.float32)
@@ -501,107 +552,13 @@ def _default_uv_name(mesh):
     return next((l.name for l in layers if l.active_render), layers[0].name)
 
 
-def _referenced_uv_maps(obj):
-    """Names of UV maps / attributes that any of the object's materials read."""
-    names, seen = set(), set()
-
-    def scan(tree):
-        if tree is None or tree.as_pointer() in seen:
-            return
-        seen.add(tree.as_pointer())
-        for node in tree.nodes:
-            uv_map = getattr(node, "uv_map", "")
-            if uv_map:
-                names.add(uv_map)
-            if node.type == 'ATTRIBUTE' and node.attribute_name:
-                names.add(node.attribute_name)
-            if node.type == 'GROUP':
-                scan(node.node_tree)
-
-    for slot in obj.material_slots:
-        if slot.material is not None:
-            scan(slot.material.node_tree)
-    return names
-
-
 def _check_source(source):
     if source is None or source.type != 'MESH':
-        raise RuntimeError("Select a mesh object to bake.")
+        raise RuntimeError("Select a mesh object.")
+    if source.get(MARKER):
+        raise RuntimeError(f"'{source.name}' is already an atlas; select the original object.")
     if not len(source.data.polygons):
         raise RuntimeError(f"'{source.name}' has no faces.")
-
-
-def _prepare_target(source, angle_limit, island_margin, log):
-    """Duplicate ``source`` and give the copy a fresh non-overlapping UV map."""
-    if bpy.context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-    name = source.name + TARGET_SUFFIX
-    old = bpy.data.objects.get(name)
-    if old is not None:
-        if not old.get(MARKER):
-            raise RuntimeError(f"An object named '{name}' already exists and was not made by "
-                               "PBR Atlas Baker. Rename it first.")
-        old_mesh = old.data
-        bpy.data.objects.remove(old, do_unlink=True)
-        if old_mesh is not None and old_mesh.users == 0:
-            bpy.data.meshes.remove(old_mesh)
-
-    target = source.copy()
-    target.data = source.data.copy()
-    target.name = name
-    target.data.name = name
-    target[MARKER] = True
-    collections = source.users_collection or (bpy.context.scene.collection,)
-    for coll in collections:
-        coll.objects.link(target)
-
-    mesh = target.data
-    default_uv = _default_uv_name(mesh)
-    # Make room for the atlas UV map (Blender allows 8): drop UV maps on the
-    # copy that no material reads. The original object is left untouched.
-    keep = _referenced_uv_maps(source)
-    if default_uv is not None:
-        keep.add(default_uv)
-    keep.discard(BAKE_UV_NAME)
-    unused = [l.name for l in mesh.uv_layers if l.name not in keep]
-    for uv_name in unused:
-        mesh.uv_layers.remove(mesh.uv_layers[uv_name])
-    if unused:
-        log(f"  removed {len(unused)} unused UV map(s) from the copy: {', '.join(unused)}")
-    if len(mesh.uv_layers) >= 8:
-        raise RuntimeError("All 8 UV maps are used by the materials, so there is no room for the "
-                           "atlas UV map. Remove one UV map from the object first.")
-    bake_uv = mesh.uv_layers.new(name=BAKE_UV_NAME, do_init=False)
-    mesh.uv_layers.active = bake_uv
-    if default_uv is not None:
-        mesh.uv_layers[default_uv].active_render = True
-
-    view_layer = bpy.context.view_layer
-    for obj in list(bpy.context.selected_objects):
-        obj.select_set(False)
-    target.hide_viewport = False
-    target.hide_select = False
-    target.hide_set(False)
-    target.select_set(True)
-    view_layer.objects.active = target
-
-    log(f"Unwrapping '{target.name}' (Smart UV Project, {math.degrees(angle_limit):.1f} deg)...")
-    bpy.ops.object.mode_set(mode='EDIT')
-    try:
-        bpy.ops.mesh.reveal(select=False)
-        bpy.ops.mesh.select_all(action='SELECT')
-        # angle_limit is in RADIANS. Passing degrees collapses every UV to (0, 0).
-        bpy.ops.uv.smart_project(angle_limit=angle_limit, island_margin=island_margin)
-    finally:
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-    uv = _uv_array(target.data, BAKE_UV_NAME)
-    lo, hi = uv.min(axis=0), uv.max(axis=0)
-    log(f"  atlas UV range: U [{lo[0]:.3f}, {hi[0]:.3f}]  V [{lo[1]:.3f}, {hi[1]:.3f}]")
-    if (hi - lo).max() < 1e-4:
-        raise RuntimeError("Smart UV Project collapsed the UVs to a point; check the angle limit.")
-    return target, default_uv
 
 
 def _output_dir(path):
@@ -625,76 +582,29 @@ def _set_colorspace(image, is_color):
             continue
 
 
-def _store_image(image, out_dir):
-    """Pack ``image`` into the .blend as a PNG. When ``out_dir`` is set, also
-    write a PNG copy there. Returns the copy's path, or None."""
-    image.file_format = 'PNG'
-    if out_dir is None:
-        image.filepath_raw = f"//{image.name}.png"  # only names the packed file
-        image.pack()
-        return None
-    path = os.path.join(out_dir, image.name + ".png")
-    image.filepath_raw = path
-    image.save()
-    image.source = 'FILE'
-    try:
-        image.filepath = bpy.path.relpath(path) if bpy.data.filepath else path
-    except ValueError:  # different drive on Windows
-        image.filepath = path
-    image.reload()
-    image.pack()
-    return path
+def _make_target(source):
+    """Duplicate ``source`` (object and mesh data) as ``<name>_ATLAS``."""
+    name = source.name + TARGET_SUFFIX
+    old = bpy.data.objects.get(name)
+    if old is not None:
+        if not old.get(MARKER):
+            raise RuntimeError(f"An object named '{name}' already exists and was not made by "
+                               "PBR Atlas Baker. Rename it first.")
+        old_mesh = old.data
+        bpy.data.objects.remove(old, do_unlink=True)
+        if old_mesh is not None and old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
 
-
-def _finalize_target(target, images, hide_source, source):
-    """Swap every slot for one master material that uses the atlases."""
-    mesh = target.data
-    for name in [l.name for l in mesh.uv_layers if l.name != BAKE_UV_NAME]:
-        mesh.uv_layers.remove(mesh.uv_layers[name])
-    uv = mesh.uv_layers[BAKE_UV_NAME]
-    mesh.uv_layers.active = uv
-    uv.active_render = True
-
-    mat_name = f"M_{target.name}"
-    mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(mat_name)
-    if mat.node_tree is None:
-        mat.use_nodes = True
-    nodes, links = mat.node_tree.nodes, mat.node_tree.links
-    nodes.clear()
-
-    out = nodes.new('ShaderNodeOutputMaterial')
-    out.location = (400, 0)
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
-    bsdf.location = (100, 0)
-    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-    def tex(channel, y):
-        node = nodes.new('ShaderNodeTexImage')
-        node.image = images[channel]
-        node.label = channel
-        node.location = (-450, y)
-        return node
-
-    links.new(tex("BaseColor", 300).outputs["Color"], bsdf.inputs["Base Color"])
-    links.new(tex("Metallic", 30).outputs["Color"], bsdf.inputs["Metallic"])
-    links.new(tex("Roughness", -240).outputs["Color"], bsdf.inputs["Roughness"])
-    normal_map = nodes.new('ShaderNodeNormalMap')
-    normal_map.location = (-150, -520)
-    links.new(tex("Normal", -520).outputs["Color"], normal_map.inputs["Color"])
-    links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
-
-    for slot in target.material_slots:
-        slot.link = 'DATA'
-    mesh.materials.clear()
-    mesh.materials.append(mat)
-    mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), np.int32))
-    mesh.update()
-
-    if hide_source:
-        source.hide_set(True)
-    target.select_set(True)
-    bpy.context.view_layer.objects.active = target
-    return mat
+    target = source.copy()
+    target.data = source.data.copy()
+    target.name = name
+    target.data.name = name
+    target[MARKER] = True
+    for coll in source.users_collection or (bpy.context.scene.collection,):
+        coll.objects.link(target)
+    target.hide_viewport = False
+    target.hide_select = False
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -702,29 +612,29 @@ def _finalize_target(target, images, hide_source, source):
 # ---------------------------------------------------------------------------
 
 def diagnose(obj):
-    """Return a text report of what the baker will read from every slot."""
+    """Return a text report of what will be read from every material slot."""
     lines = ["=" * 72]
     if obj is None or obj.type != 'MESH':
         lines += ["PBR ATLAS DIAGNOSTIC: no mesh object selected", "=" * 72]
         return "\n".join(lines)
     mesh = obj.data
-    _, tri_mats = _triangles(mesh)
     plan = build_plan(obj)
-    counts = np.bincount(np.clip(tri_mats, 0, len(plan) - 1), minlength=len(plan))
+    face_mat = np.empty(len(mesh.polygons), np.int32)
+    mesh.polygons.foreach_get("material_index", face_mat)
+    counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
     uv_names = [l.name + (" (render)" if l.active_render else "") for l in mesh.uv_layers]
 
     lines += [
         f"PBR ATLAS DIAGNOSTIC: '{obj.name}'",
         "=" * 72,
-        f"Triangles: {len(tri_mats)}   Material slots: {len(obj.material_slots)}",
+        f"Faces: {len(face_mat)}   Material slots: {len(obj.material_slots)}",
         f"UV maps: {', '.join(uv_names) or 'NONE'}",
-        f"Custom split normals: {'yes' if getattr(mesh, 'has_custom_normals', False) else 'no'}",
         "-" * 72,
     ]
     total_warnings = 0
     for i, entry in enumerate(plan):
         mat = entry["material"]
-        lines.append(f"Slot {i:02d}  '{mat.name if mat else '<empty>'}'  ({counts[i]} triangles)")
+        lines.append(f"Slot {i:02d}  '{mat.name if mat else '<empty>'}'  ({counts[i]} faces)")
         for channel in CHANNELS:
             lines.append(f"    {channel:<10} {entry['sources'][channel].describe()}")
         for w in entry["warnings"]:
@@ -744,460 +654,790 @@ def write_report(obj):
 
 
 # ---------------------------------------------------------------------------
-# GPU rasteriser
+# Texture access
 # ---------------------------------------------------------------------------
 
-_VERTEX_SOURCE = """
-void main()
-{
-  v_uv = a_uv;
-  v_rot = a_rot;
-  gl_Position = vec4(a_pos * 2.0 - 1.0, 0.0, 1.0);
-}
-"""
-
-_FRAGMENT_SOURCE = """
-vec3 linear_to_srgb(vec3 c)
-{
-  c = clamp(c, 0.0, 1.0);
-  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
-}
-
-vec2 wrap_uv(vec2 uv)
-{
-  if (u_wrap == 1) {
-    return clamp(uv, 0.0, 1.0);
-  }
-  if (u_wrap == 2) {
-    return 1.0 - abs(mod(uv, 2.0) - 1.0);
-  }
-  return fract(uv);
-}
-
-void main()
-{
-  /* Gradients come from the unwrapped UVs so tiling seams pick the right mip. */
-  vec4 s = textureGrad(u_tex, wrap_uv(v_uv), dFdx(v_uv), dFdy(v_uv));
-  vec3 c = (dot(u_mask, vec4(1.0)) > 0.5) ? vec3(dot(s, u_mask)) : s.rgb;
-  c = c * u_scale.rgb + u_offset.rgb;
-  if (u_normal != 0) {
-    /* Re-express the tangent-space normal in the atlas UV's tangent frame. */
-    vec3 n = c * 2.0 - 1.0;
-    vec2 xy = vec2(dot(v_rot.xy, n.xy), dot(v_rot.zw, n.xy)) * u_strength;
-    n = normalize(vec3(xy, max(n.z, 1e-4)));
-    c = n * 0.5 + 0.5;
-  }
-  else if (u_srgb != 0) {
-    c = linear_to_srgb(c);
-  }
-  FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
-}
-"""
+_SRGB_TO_LINEAR = np.array(
+    [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in np.arange(256) / 255.0],
+    np.float32)
 
 
-def _atlas_shader():
-    import gpu
-
-    iface = gpu.types.GPUStageInterfaceInfo("pbr_atlas_iface")
-    iface.smooth('VEC2', "v_uv")
-    iface.flat('VEC4', "v_rot")
-
-    info = gpu.types.GPUShaderCreateInfo()
-    info.vertex_in(0, 'VEC2', "a_pos")
-    info.vertex_in(1, 'VEC2', "a_uv")
-    info.vertex_in(2, 'VEC4', "a_rot")
-    info.vertex_out(iface)
-    info.sampler(0, 'FLOAT_2D', "u_tex")
-    info.push_constant('VEC4', "u_scale")
-    info.push_constant('VEC4', "u_offset")
-    info.push_constant('VEC4', "u_mask")
-    info.push_constant('FLOAT', "u_strength")
-    info.push_constant('INT', "u_wrap")
-    info.push_constant('INT', "u_normal")
-    info.push_constant('INT', "u_srgb")
-    info.fragment_out(0, 'VEC4', "FragColor")
-    info.vertex_source(_VERTEX_SOURCE)
-    info.fragment_source(_FRAGMENT_SOURCE)
-    return gpu.shader.create_from_info(info)
+def _linear_to_srgb(x):
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
 
 
-def _dummy_texture():
-    import gpu
-    data = gpu.types.Buffer('FLOAT', 4, [1.0, 1.0, 1.0, 1.0])
-    return gpu.types.GPUTexture((1, 1), format='RGBA32F', data=data)
+def _wrap_index(index, size, wrap):
+    """Texel index -> valid index, following the Image Texture node's Extension."""
+    if wrap == 'REPEAT':
+        return np.mod(index, size)
+    if wrap == 'MIRROR':
+        m = np.mod(index, 2 * size)
+        return np.where(m < size, m, 2 * size - 1 - m)
+    return np.clip(index, 0, size - 1)
 
 
-def _render(size, draw):
-    """Run ``draw`` into a cleared size x size RGBA8 target; return uint8 pixels."""
-    import gpu
-
-    offscreen = gpu.types.GPUOffScreen(size, size, format='RGBA8')
-    try:
-        with offscreen.bind():
-            fb = gpu.state.active_framebuffer_get()
-            fb.clear(color=(0.0, 0.0, 0.0, 0.0))
-            gpu.state.viewport_set(0, 0, size, size)
-            gpu.state.blend_set('NONE')
-            gpu.state.depth_test_set('NONE')
-            gpu.state.face_culling_set('NONE')
-            draw()
-            buf = fb.read_color(0, 0, size, size, 4, 0, 'UBYTE')
-    finally:
-        offscreen.free()
-    buf.dimensions = size * size * 4
-    try:
-        pixels = np.frombuffer(buf, dtype=np.uint8).copy()
-    except (TypeError, ValueError):
-        pixels = np.array(buf.to_list(), dtype=np.uint8)
-    return pixels.reshape(size, size, 4)
+def _affine2x3(matrix):
+    """Mapping-node matrix (or None) -> 2x3 array acting on (u, v, 1)."""
+    if matrix is None:
+        return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    return np.array([[matrix[0][0], matrix[0][1], matrix[0][3]],
+                     [matrix[1][0], matrix[1][1], matrix[1][3]]])
 
 
-def _set_uniforms(shader, src, channel, dummy):
-    import gpu
+class _Texture:
+    """Pixels of one source image, kept in their original precision."""
 
-    textured = src.image is not None
-    shader.uniform_sampler("u_tex", gpu.texture.from_image(src.image) if textured else dummy)
-    shader.uniform_float("u_scale", src.scale if textured else (0.0, 0.0, 0.0, 0.0))
-    shader.uniform_float("u_offset", src.offset)
-    shader.uniform_float("u_mask", src.mask if (textured and src.mask) else (0.0, 0.0, 0.0, 0.0))
-    shader.uniform_float("u_strength", float(src.strength))
-    shader.uniform_int("u_wrap", _WRAP_MODES.get(src.wrap, 0))
-    shader.uniform_int("u_normal", 1 if channel == "Normal" else 0)
-    shader.uniform_int("u_srgb", 1 if channel == "BaseColor" else 0)
+    def __init__(self, image):
+        width, height = image.size
+        buf = np.empty(width * height * 4, np.float32)
+        image.pixels.foreach_get(buf)
+        self.is_float = bool(image.is_float)
+        if self.is_float:
+            self.data = buf.reshape(height, width, 4)
+        else:
+            np.multiply(buf, 255.0, out=buf)
+            np.rint(buf, out=buf)
+            self.data = buf.astype(np.uint8).reshape(height, width, 4)
+        self.width, self.height = width, height
+        self.srgb = not self.is_float and not _is_data(image)
+        digest = hashlib.blake2b(self.data, digest_size=16).hexdigest()
+        self.key = (digest, width, height, self.is_float, self.srgb)
+        self._mean = None
 
+    def linear(self, raw):
+        """Raw texels -> float32 scene-linear values, as Blender renders them."""
+        if self.is_float:
+            return raw.astype(np.float32)
+        out = raw.astype(np.float32) * (1.0 / 255.0)
+        if self.srgb:
+            out[..., :3] = _SRGB_TO_LINEAR[raw[..., :3]]
+        return out
 
-def _draw(shader, primitive, pos, uv, rot):
-    from gpu_extras.batch import batch_for_shader
+    def block(self, x0, y0, w, h, wrap):
+        """Texels [x0, x0 + w) x [y0, y0 + h) exactly as stored."""
+        if 0 <= x0 and x0 + w <= self.width and 0 <= y0 and y0 + h <= self.height:
+            return self.data[y0:y0 + h, x0:x0 + w]
+        xs = _wrap_index(np.arange(x0, x0 + w), self.width, wrap)
+        ys = _wrap_index(np.arange(y0, y0 + h), self.height, wrap)
+        return self.data[ys[:, None], xs[None, :]]
 
-    batch = batch_for_shader(shader, primitive, {
-        "a_pos": np.ascontiguousarray(pos, np.float32),
-        "a_uv": np.ascontiguousarray(uv, np.float32),
-        "a_rot": np.ascontiguousarray(rot, np.float32),
-    })
-    batch.draw(shader)
+    def bilinear(self, px, py, wrap):
+        """Linear values at texel coordinates (texel centres sit at i + 0.5)."""
+        x, y = px - 0.5, py - 0.5
+        xf, yf = np.floor(x), np.floor(y)
+        fx, fy = (x - xf)[..., None], (y - yf)[..., None]
+        xi, yi = xf.astype(np.int64), yf.astype(np.int64)
+        x0, x1 = _wrap_index(xi, self.width, wrap), _wrap_index(xi + 1, self.width, wrap)
+        y0, y1 = _wrap_index(yi, self.height, wrap), _wrap_index(yi + 1, self.height, wrap)
+        lin = self.linear
+        lower = lin(self.data[y0, x0]) * (1 - fx) + lin(self.data[y0, x1]) * fx
+        upper = lin(self.data[y1, x0]) * (1 - fx) + lin(self.data[y1, x1]) * fx
+        return lower * (1 - fy) + upper * fy
 
-
-def _probe_flip(shader, dummy):
-    """Draw into the lower half of a tiny target to learn the readback's row order."""
-    pos = np.array([(0, 0), (1, 0), (1, 0.5), (0, 0), (1, 0.5), (0, 0.5)], np.float32)
-    white = ChannelSource((1.0, 1.0, 1.0, 1.0))
-
-    def draw():
-        shader.bind()
-        _set_uniforms(shader, white, "Roughness", dummy)
-        _draw(shader, 'TRIS', pos, pos, np.tile((1.0, 0.0, 0.0, 1.0), (6, 1)))
-
-    alpha = _render(8, draw)[..., 3]
-    if alpha[0].min() == 255 and alpha[-1].max() == 0:
-        return False
-    if alpha[-1].min() == 255 and alpha[0].max() == 0:
-        return True
-    raise RuntimeError("GPU readback check failed: nothing was drawn. "
-                       "Try switching the GPU backend in Preferences > System.")
-
-
-def _tangent_rotation(src, dst):
-    """Per-triangle 2x2 matrix taking tangent-space XY from the source UV
-    layout to the atlas layout.
-
-    ``src`` and ``dst`` are (n, 3, 2) UV triangles. The affine map between
-    the two layouts is reduced to its closest rotation (or reflection, for
-    mirrored islands). Returns (n, 4) rows of (m00, m01, m10, m11).
-    """
-    a1, a2 = src[:, 1] - src[:, 0], src[:, 2] - src[:, 0]
-    b1, b2 = dst[:, 1] - dst[:, 0], dst[:, 2] - dst[:, 0]
-    det = a1[:, 0] * a2[:, 1] - a2[:, 0] * a1[:, 1]
-    ok = np.abs(det) > 1e-12
-    inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
-    m00 = (b1[:, 0] * a2[:, 1] - b2[:, 0] * a1[:, 1]) * inv
-    m01 = (b2[:, 0] * a1[:, 0] - b1[:, 0] * a2[:, 0]) * inv
-    m10 = (b1[:, 1] * a2[:, 1] - b2[:, 1] * a1[:, 1]) * inv
-    m11 = (b2[:, 1] * a1[:, 0] - b1[:, 1] * a2[:, 0]) * inv
-    mirrored = (m00 * m11 - m01 * m10) < 0.0
-    angle = np.where(mirrored, np.arctan2(m01 + m10, m00 - m11), np.arctan2(m10 - m01, m00 + m11))
-    c, s = np.cos(angle), np.sin(angle)
-    rot = np.stack([c, np.where(mirrored, s, -s), s, np.where(mirrored, -c, c)], axis=1)
-    rot[~ok] = (1.0, 0.0, 0.0, 1.0)
-    return rot.astype(np.float32)
+    def mean(self):
+        if self._mean is None:
+            self._mean = self.linear(self.data).reshape(-1, 4).mean(axis=0)
+        return self._mean
 
 
-def _apply_affine(uv, m):
-    a = np.array([[m[0][0], m[0][1]], [m[1][0], m[1][1]]], np.float32)
-    t = np.array([m[0][3], m[1][3]], np.float32)
-    return uv @ a.T + t
+class _TextureCache:
+    def __init__(self):
+        self._textures = {}
+
+    def get(self, image):
+        ptr = image.as_pointer()
+        if ptr not in self._textures:
+            self._textures[ptr] = _Texture(image)
+        return self._textures[ptr]
+
+    def key(self, image):
+        return self.get(image).key
 
 
-class _MeshData:
-    """Triangle and UV arrays of the target mesh, read once."""
+class _MeshLoops:
+    """Face, loop and UV arrays of the source mesh."""
 
-    def __init__(self, mesh, default_uv, slot_count):
+    def __init__(self, mesh):
         self.mesh = mesh
-        self.default_uv = default_uv
-        self.tri_loops, mats = _triangles(mesh)
-        self.tri_mats = np.clip(mats, 0, max(slot_count - 1, 0))
-        self.bake_uv = _uv_array(mesh, BAKE_UV_NAME)
-        self._uv_cache = {}
+        n_faces = len(mesh.polygons)
+        ints = np.empty(n_faces, np.int32)
+        mesh.polygons.foreach_get("loop_start", ints)
+        self.loop_start = ints.astype(np.int64)
+        mesh.polygons.foreach_get("loop_total", ints)
+        self.loop_total = ints.astype(np.int64)
+        mesh.polygons.foreach_get("material_index", ints)
+        self.face_material = ints.astype(np.int64)
+        verts = np.empty(len(mesh.loops), np.int32)
+        mesh.loops.foreach_get("vertex_index", verts)
+        self.loop_vertex = verts.astype(np.int64)
+        self.default_uv = _default_uv_name(mesh)
+        self._uv = {}
 
     def uv(self, name):
         name = name or self.default_uv
-        if name not in self._uv_cache:
-            self._uv_cache[name] = _uv_array(self.mesh, name)
-        return self._uv_cache[name]
+        if name not in self._uv:
+            self._uv[name] = _uv_array(self.mesh, name).astype(np.float64)
+        return self._uv[name]
 
-    def slot_triangles(self, slot):
-        return np.flatnonzero(self.tri_mats == slot)
-
-    def geometry(self, tris, src, channel):
-        loops = self.tri_loops[tris]
-        dst = self.bake_uv[loops]
-        uv = self.uv(src.uv_layer)[loops]
-        if src.uv_affine is not None:
-            uv = _apply_affine(uv, src.uv_affine)
-        if channel == "Normal" and src.image is not None:
-            rot = _tangent_rotation(self.uv(src.tangent_uv)[loops], dst)
-        else:
-            rot = np.tile(np.array((1.0, 0.0, 0.0, 1.0), np.float32), (len(tris), 1))
-        return dst, uv, rot
+    def loops_of(self, faces):
+        """Loop indices of ``faces`` and, per loop, the position of its face in ``faces``."""
+        starts, totals = self.loop_start[faces], self.loop_total[faces]
+        local_face = np.repeat(np.arange(len(faces)), totals)
+        offsets = np.concatenate(([0], np.cumsum(totals)[:-1]))
+        loops = np.repeat(starts - offsets, totals) + np.arange(int(totals.sum()))
+        return loops, local_face
 
 
-def _draw_channel(shader, dummy, mesh_data, plan, channel):
+# ---------------------------------------------------------------------------
+# Material groups and chunks
+# ---------------------------------------------------------------------------
+
+class _Master:
+    """The texel grid a group's chunks are cut from: its largest texture."""
+
+    def __init__(self, texture, uv_layer, affine, wrap):
+        self.texture = texture
+        self.width, self.height = texture.width, texture.height
+        self.uv_layer, self.affine, self.wrap = uv_layer, affine, wrap
+        self._inverse = np.linalg.inv(affine[:, :2])
+
+    def to_texels(self, uv):
+        t = uv @ self.affine[:, :2].T + self.affine[:, 2]
+        return t * (self.width, self.height)
+
+    def to_uv(self, px, py):
+        tx = px / self.width - self.affine[0, 2]
+        ty = py / self.height - self.affine[1, 2]
+        inv = self._inverse
+        return inv[0, 0] * tx + inv[0, 1] * ty, inv[1, 0] * tx + inv[1, 1] * ty
+
+
+class _Chunk:
+    """A rectangle of source texels, and where it lands in the atlas."""
+
+    def __init__(self, x0, y0, w, h):
+        self.x0, self.y0, self.w, self.h = int(x0), int(y0), int(w), int(h)
+        self.base_scale = 1.0
+        self.scale = 1.0
+        self.aw, self.ah = self.w, self.h   # size in the atlas
+        self.ax = self.ay = 0               # position in the atlas
+        self.flat = None                    # {channel: texel} when it is one flat colour
+
+    def rescale(self, scale):
+        self.scale = scale
+        self.aw = max(1, int(math.ceil(self.w * scale)))
+        self.ah = max(1, int(math.ceil(self.h * scale)))
+
+    def make_flat(self, values, size):
+        self.flat = values
+        self.aw = self.ah = size
+
+
+class _Group:
+    """Material slots whose channels are identical, packed together."""
+
+    def __init__(self, sources):
+        self.sources = sources
+        self.slots = []
+        self.faces = []
+        self.master = None
+        self.chunks = []
+        self.loops = None       # loop indices of the group's faces
+        self.loop_texel = None  # per loop: position on the master texel grid
+        self.loop_chunk = None  # per loop: index into self.chunks
+        self.normal_rotation = None
+
+
+def _group_slots(plan, loops, cache):
+    face_slot = np.clip(loops.face_material, 0, len(plan) - 1)
+    groups = {}
     for slot, entry in enumerate(plan):
-        tris = mesh_data.slot_triangles(slot)
-        if not tris.size:
+        faces = np.flatnonzero(face_slot == slot)
+        if not faces.size:
             continue
-        src = entry["sources"][channel]
-        dst, uv, rot = mesh_data.geometry(tris, src, channel)
-        shader.bind()
-        _set_uniforms(shader, src, channel, dummy)
-        # Edges first: guarantees sub-pixel slivers (strings, fret wires) get pixels.
-        order = list(_EDGE_ORDER)
-        _draw(shader, 'LINES', dst[:, order].reshape(-1, 2), uv[:, order].reshape(-1, 2),
-              np.repeat(rot, 6, axis=0))
-        _draw(shader, 'TRIS', dst.reshape(-1, 2), uv.reshape(-1, 2), np.repeat(rot, 3, axis=0))
+        key = tuple(entry["sources"][ch].key(cache.key, loops.default_uv) for ch in CHANNELS)
+        group = groups.setdefault(key, _Group(entry["sources"]))
+        group.slots.append(slot)
+        group.faces.append(faces)
+    for group in groups.values():
+        group.faces = np.concatenate(group.faces)
+    return list(groups.values())
 
 
-_NEIGHBOURS = ((0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1))
+def _pick_master(group, cache, default_uv, warn):
+    best = None
+    for channel in CHANNELS:
+        src = group.sources[channel]
+        if src.image is None:
+            continue
+        tex = cache.get(src.image)
+        if best is None or tex.width * tex.height > best[0].width * best[0].height:
+            best = (tex, src)
+    if best is None:
+        return None
+    tex, src = best
+    affine = _affine2x3(src.uv_affine)
+    if abs(np.linalg.det(affine[:, :2])) < 1e-12:
+        warn(f"a Mapping node on '{src.image.name}' collapses the UVs; it is ignored")
+        affine = _affine2x3(None)
+    return _Master(tex, src.uv_layer or default_uv, affine, src.wrap)
 
 
-def _dilation_index(covered, margin):
-    """For each pixel, the index of the covered pixel it should copy.
+def _normal_rotation(group, default_uv, warn):
+    """Tangent-space fix-up for normal maps when a Mapping node rotates or
+    mirrors the texture (moving the UVs into the atlas then turns the
+    tangents). None when nothing needs to change, which is the usual case."""
+    src = group.sources["Normal"]
+    if src.image is None or group.master is None:
+        return None
+    if (src.tangent_uv or default_uv) != group.master.uv_layer:
+        warn(f"normal map '{src.image.name}' uses a different UV map than its material's "
+             "other textures; its tangents may not match")
+        return None
+    (a, b), (c, d) = group.master.affine[:, :2] * [[group.master.width], [group.master.height]]
+    if a * d - b * c < 0:
+        angle = math.atan2(b + c, a - d)
+        rot = (math.cos(angle), math.sin(angle), math.sin(angle), -math.cos(angle))
+    else:
+        angle = math.atan2(c - b, a + d)
+        rot = (math.cos(angle), -math.sin(angle), math.sin(angle), math.cos(angle))
+    return None if np.allclose(rot, (1.0, 0.0, 0.0, 1.0), atol=1e-6) else rot
 
-    Grows islands outwards by ``margin`` pixels (-1 = still empty).
-    """
-    h, w = covered.shape
-    idx = np.full((h, w), -1, np.int32)
-    idx[covered] = np.flatnonzero(covered)
-    for _ in range(margin):
-        if not (idx < 0).any():
+
+def _components(edge_a, edge_b, count):
+    """Connected components of ``count`` nodes joined by edges -> labels 0..k-1."""
+    label = np.arange(count)
+    while True:
+        new = label.copy()
+        np.minimum.at(new, edge_a, label[edge_b])
+        np.minimum.at(new, edge_b, label[edge_a])
+        new = new[new]
+        if np.array_equal(new, label):
             break
-        prev = idx.copy()
-        for dy, dx in _NEIGHBOURS:
-            dst = idx[max(dy, 0):h + min(dy, 0), max(dx, 0):w + min(dx, 0)]
-            src = prev[max(-dy, 0):h + min(-dy, 0), max(-dx, 0):w + min(-dx, 0)]
-            take = (dst < 0) & (src >= 0)
-            dst[take] = src[take]
-    return idx.ravel()
+        label = new
+    return np.unique(label, return_inverse=True)[1].ravel()
 
 
-def _pad(pixels, fill_idx, background):
-    flat = pixels.reshape(-1, 4)
-    out = flat[np.maximum(fill_idx, 0)]
-    out[fill_idx < 0, :3] = background
-    out[:, 3] = 255
+def _merge_overlaps(rects):
+    """Merge overlapping rectangles until none overlap.
+
+    ``rects`` is (n, 4) of x0, y0, x1, y1 (end exclusive). Returns the merged
+    rectangles and, for every input rectangle, the index of its merged one.
+    """
+    owner = np.arange(len(rects))
+    while True:
+        n = len(rects)
+        edges_a, edges_b = [], []
+        for start in range(0, n, 512):
+            blk = rects[start:start + 512]
+            hit = ((blk[:, None, 0] < rects[None, :, 2]) & (rects[None, :, 0] < blk[:, None, 2]) &
+                   (blk[:, None, 1] < rects[None, :, 3]) & (rects[None, :, 1] < blk[:, None, 3]))
+            a, b = np.nonzero(hit)
+            edges_a.append(a + start)
+            edges_b.append(b)
+        label = _components(np.concatenate(edges_a), np.concatenate(edges_b), n)
+        k = int(label.max()) + 1
+        if k == n:
+            return rects, owner
+        merged = np.empty((k, 4), np.int64)
+        merged[:, :2] = np.iinfo(np.int64).max
+        merged[:, 2:] = np.iinfo(np.int64).min
+        for col, op in ((0, np.minimum), (1, np.minimum), (2, np.maximum), (3, np.maximum)):
+            column = merged[:, col].copy()
+            op.at(column, label, rects[:, col])
+            merged[:, col] = column
+        owner = label[owner]
+        rects = merged
+
+
+def _cut_chunks(group, loops, padding):
+    """Find the texel rectangles the group's UV islands use."""
+    idx, local_face = loops.loops_of(group.faces)
+    uv = loops.uv(group.master.uv_layer)[idx]
+    texel = group.master.to_texels(uv)
+
+    # UV islands: faces that share a vertex with the same UV coordinate.
+    quant = np.round(uv * (1 << 20)).astype(np.int64)
+    keys = np.stack([loops.loop_vertex[idx], quant[:, 0], quant[:, 1]], axis=1)
+    key_id = np.unique(keys, axis=0, return_inverse=True)[1].ravel()
+    n_faces = len(group.faces)
+    labels = _components(local_face, n_faces + key_id, n_faces + int(key_id.max()) + 1)
+    island = np.unique(labels[:n_faces], return_inverse=True)[1].ravel()
+    loop_island = island[local_face]
+
+    n = int(island.max()) + 1
+    lo = np.full((n, 2), np.inf)
+    hi = np.full((n, 2), -np.inf)
+    np.minimum.at(lo, loop_island, texel)
+    np.maximum.at(hi, loop_island, texel)
+    rects = np.empty((n, 4), np.int64)
+    rects[:, :2] = np.floor(lo) - padding
+    rects[:, 2:] = np.ceil(hi) + padding
+    rects[:, 2:] = np.maximum(rects[:, 2:], rects[:, :2] + 1)
+
+    merged, owner = _merge_overlaps(rects)
+    group.chunks = [_Chunk(x0, y0, x1 - x0, y1 - y0) for x0, y0, x1, y1 in merged]
+    group.loops = idx
+    group.loop_texel = texel
+    group.loop_chunk = owner[loop_island]
+
+
+# ---------------------------------------------------------------------------
+# Chunk pixels
+# ---------------------------------------------------------------------------
+
+def _apply(src, linear, kind):
+    """Channel selection and factor math on linear values."""
+    if src.mask is not None:
+        v = linear @ np.asarray(src.mask, np.float32)
+        v = (v * src.scale[0] + src.offset[0])[..., None]
+        return v if kind == "linear" else np.repeat(v, 3, axis=-1)
+    v = linear[..., :3] * np.asarray(src.scale[:3], np.float32) + np.asarray(src.offset[:3], np.float32)
+    return v[..., :1] if kind == "linear" else v
+
+
+def _encode(values, kind, rotation=None, strength=1.0):
+    """Linear values -> 8-bit texels for the atlas."""
+    if kind == "srgb":
+        values = _linear_to_srgb(values)
+    elif kind == "normal":
+        n = values * 2.0 - 1.0
+        x, y, z = n[..., 0], n[..., 1], np.maximum(n[..., 2], 1e-4)
+        if rotation is not None:
+            x, y = rotation[0] * x + rotation[1] * y, rotation[2] * x + rotation[3] * y
+        x, y = x * strength, y * strength
+        length = np.sqrt(x * x + y * y + z * z)
+        values = np.stack([x, y, z], axis=-1) / length[..., None] * 0.5 + 0.5
+    return np.rint(np.clip(values, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _verbatim_channels(src, tex, kind, rotation):
+    """Texel channels that can be copied byte for byte, or None when a
+    conversion is needed (colour space, factor math, normal strength...)."""
+    if tex.is_float:
+        return None
+    if src.mask is None:
+        if tuple(src.scale[:3]) != (1.0, 1.0, 1.0) or any(src.offset[:3]):
+            return None
+        if kind == "srgb" and tex.srgb:
+            return [0, 1, 2]
+        if kind == "normal" and not tex.srgb and src.strength == 1.0 and rotation is None:
+            return [0, 1, 2]
+        return None
+    hot = [i for i, w in enumerate(src.mask) if w]
+    if len(hot) != 1 or src.mask[hot[0]] != 1.0 or src.scale[0] != 1.0 or src.offset[0] != 0.0:
+        return None
+    k = hot[0]
+    if kind == "linear" and (k == 3 or not tex.srgb):
+        return [k]
+    if kind == "srgb" and k < 3 and tex.srgb:
+        return [k, k, k]
+    return None
+
+
+def _resample(chunk, master, src, tex):
+    """Linear values of ``src`` on the chunk's atlas texels (bilinear)."""
+    affine = _affine2x3(src.uv_affine)
+    out = np.empty((chunk.ah, chunk.aw, 4), np.float32)
+    xs = chunk.x0 + (np.arange(chunk.aw) + 0.5) / chunk.scale
+    for row in range(0, chunk.ah, 256):
+        ys = chunk.y0 + (np.arange(row, min(row + 256, chunk.ah)) + 0.5) / chunk.scale
+        px, py = np.meshgrid(xs, ys)
+        u, v = master.to_uv(px, py)
+        tx = (affine[0, 0] * u + affine[0, 1] * v + affine[0, 2]) * tex.width
+        ty = (affine[1, 0] * u + affine[1, 1] * v + affine[1, 2]) * tex.height
+        out[row:row + len(ys)] = tex.bilinear(tx, ty, src.wrap)
     return out
 
 
-def bake_gpu_atlas(source, resolution=4096, margin=16, angle_limit=math.radians(66.0),
-                   island_margin=0.005, output_dir=None, hide_source=True, log=print):
-    """Rasterise every material of ``source`` into four PBR atlases.
+def _block(ctx, group, chunk, channel):
+    """8-bit texels of ``channel`` for one chunk: (ah, aw, 3), or (ah, aw, 1)
+    for Alpha / Roughness / Metallic."""
+    kind = _KIND[channel]
+    shape = (chunk.ah, chunk.aw, 1 if kind == "linear" else 3)
+    if chunk.flat is not None:
+        return np.broadcast_to(chunk.flat[channel], shape)
+    src = group.sources[channel]
+    rotation = group.normal_rotation if channel == "Normal" else None
+    strength = src.strength if channel == "Normal" else 1.0
+    if src.image is None:
+        value = np.asarray(src.offset[:shape[2]], np.float32).reshape(1, 1, -1)
+        return np.broadcast_to(_encode(value, kind, rotation, strength), shape)
 
-    The atlases are packed into the .blend; ``output_dir`` optionally also
-    writes PNG copies. Returns a dict with the new object, the images, the
-    PNG paths (if any) and statistics.
+    tex = ctx.cache.get(src.image)
+    master = group.master
+    uv_layer = src.uv_layer or ctx.default_uv
+    same_grid = (chunk.scale == 1.0 and tex.width == master.width and tex.height == master.height
+                 and uv_layer == master.uv_layer
+                 and np.allclose(_affine2x3(src.uv_affine), master.affine))
+    if same_grid:
+        raw = tex.block(chunk.x0, chunk.y0, chunk.w, chunk.h, src.wrap)
+        channels = _verbatim_channels(src, tex, kind, rotation)
+        if channels == [0, 1, 2]:
+            return raw[..., :3]
+        if channels is not None:
+            return raw[..., channels]
+        linear = tex.linear(raw)
+    elif uv_layer != master.uv_layer:
+        ctx.warn(f"'{src.image.name}' uses UV map '{uv_layer}' while its material's main texture "
+                 f"uses '{master.uv_layer}'; its average colour is used")
+        linear = tex.mean().reshape(1, 1, 4)
+    else:
+        linear = _resample(chunk, master, src, tex)
+    encoded = _encode(_apply(src, linear, kind), kind, rotation, strength)
+    return np.broadcast_to(encoded, shape)
+
+
+def _flat_values(ctx, group, chunk, channels):
+    """{channel: texel} if every channel of the chunk is one flat colour."""
+    values = {}
+    for channel in channels:
+        block = _block(ctx, group, chunk, channel)
+        first = block[0, 0].copy()
+        if not (block == first).all():
+            return None
+        values[channel] = first
+    return values
+
+
+class _Context:
+    def __init__(self, cache, default_uv, warn):
+        self.cache, self.default_uv, self.warn = cache, default_uv, warn
+
+
+# ---------------------------------------------------------------------------
+# Packing
+# ---------------------------------------------------------------------------
+
+class _MaxRects:
+    """MaxRects bin packer (best short side fit), no rotation."""
+
+    def __init__(self, size):
+        self.free = [(0, 0, size, size)]
+
+    def insert(self, w, h):
+        best = None
+        for fx, fy, fw, fh in self.free:
+            if w <= fw and h <= fh:
+                fit = (min(fw - w, fh - h), max(fw - w, fh - h))
+                if best is None or fit < best[0]:
+                    best = (fit, fx, fy)
+        if best is None:
+            return None
+        _, x, y = best
+        self._split(x, y, w, h)
+        return x, y
+
+    def _split(self, x, y, w, h):
+        keep, new = [], []
+        for rect in self.free:
+            fx, fy, fw, fh = rect
+            if x >= fx + fw or x + w <= fx or y >= fy + fh or y + h <= fy:
+                keep.append(rect)
+                continue
+            if x > fx:
+                new.append((fx, fy, x - fx, fh))
+            if x + w < fx + fw:
+                new.append((x + w, fy, fx + fw - x - w, fh))
+            if y > fy:
+                new.append((fx, fy, fw, y - fy))
+            if y + h < fy + fh:
+                new.append((fx, y + h, fw, fy + fh - y - h))
+
+        def inside(a, b):
+            return (a[0] >= b[0] and a[1] >= b[1] and
+                    a[0] + a[2] <= b[0] + b[2] and a[1] + a[3] <= b[1] + b[3])
+
+        unique_new = []
+        for i, a in enumerate(new):
+            if any(inside(a, b) for b in keep):
+                continue
+            if any(inside(a, b) and (a != b or j < i) for j, b in enumerate(new) if j != i):
+                continue
+            unique_new.append(a)
+        keep = [a for a in keep if not any(inside(a, b) for b in unique_new)]
+        self.free = keep + unique_new
+
+
+def _try_pack(chunks, size):
+    order = sorted(range(len(chunks)),
+                   key=lambda i: (max(chunks[i].aw, chunks[i].ah), chunks[i].aw * chunks[i].ah),
+                   reverse=True)
+    packer = _MaxRects(size)
+    spots = [None] * len(chunks)
+    for i in order:
+        spot = packer.insert(chunks[i].aw, chunks[i].ah)
+        if spot is None:
+            return None
+        spots[i] = spot
+    return spots
+
+
+def _pack(chunks, max_size, warn, log):
+    """Place every chunk; returns the atlas size (smallest power of two that fits)."""
+    def place(spots):
+        for chunk, (x, y) in zip(chunks, spots):
+            chunk.ax, chunk.ay = x, y
+
+    area = sum(c.aw * c.ah for c in chunks)
+    side = max(max(c.aw, c.ah) for c in chunks)
+    for size in _ATLAS_SIZES:
+        if size > max_size:
+            break
+        if size * size < area or size < side:
+            continue
+        log(f"  trying {size} x {size}...")
+        spots = _try_pack(chunks, size)
+        if spots is not None:
+            place(spots)
+            return size
+
+    factor = min(1.0, math.sqrt(max_size * max_size / area))
+    while True:
+        factor *= 0.95
+        for chunk in chunks:
+            if chunk.flat is None:
+                chunk.rescale(chunk.base_scale * factor)
+        spots = _try_pack(chunks, max_size)
+        if spots is not None:
+            place(spots)
+            warn(f"the textures need more room than {max_size} x {max_size}, so they were scaled "
+                 f"to {factor:.0%}. Raise the maximum atlas size to keep full quality.")
+            return max_size
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def _png_bytes(pixels, alpha):
+    """Encode (h, w, 4) uint8 pixels (bottom row first, like Blender) as PNG."""
+    h, w, _ = pixels.shape
+    c = 4 if alpha else 3
+    rows = np.ascontiguousarray(pixels[::-1, :, :c]).reshape(h, w * c)
+    filtered = np.empty((h, w * c + 1), np.uint8)
+    filtered[:, 0] = 1  # "Sub" filter: store the difference to the texel on the left
+    filtered[:, 1:c + 1] = rows[:, :c]
+    np.subtract(rows[:, c:], rows[:, :-c], out=filtered[:, c + 1:])
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    header = struct.pack(">IIBBBBB", w, h, 8, 6 if alpha else 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(filtered, 1)) + chunk(b"IEND", b""))
+
+
+def _packed_image(name, png, is_color, path=None):
+    """An image whose pixels live inside the .blend (packed PNG)."""
+    old = bpy.data.images.get(name)
+    if old is not None:
+        bpy.data.images.remove(old)
+    image = bpy.data.images.new(name, 1, 1)
+    image.source = 'FILE'
+    image.filepath = f"//{name}.png"
+    if path:
+        try:
+            image.filepath = bpy.path.relpath(path) if bpy.data.filepath else path
+        except ValueError:  # different drive on Windows
+            image.filepath = path
+    image.pack(data=png, data_len=len(png))
+    image.buffers_free()  # drop the 1x1 placeholder; pixels now load from the packed PNG
+    _set_colorspace(image, is_color)
+    return image
+
+
+def _master_material(name, images, has_alpha, emission_strength):
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    if mat.node_tree is None:
+        mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new('ShaderNodeOutputMaterial')
+    out.location = (400, 0)
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+    bsdf.location = (100, 0)
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    def tex(channel, y):
+        node = nodes.new('ShaderNodeTexImage')
+        node.image = images[channel]
+        node.label = channel
+        node.location = (-450, y)
+        return node
+
+    base = tex("BaseColor", 300)
+    links.new(base.outputs["Color"], bsdf.inputs["Base Color"])
+    if has_alpha:
+        links.new(base.outputs["Alpha"], bsdf.inputs["Alpha"])
+    links.new(tex("Metallic", 30).outputs["Color"], bsdf.inputs["Metallic"])
+    links.new(tex("Roughness", -240).outputs["Color"], bsdf.inputs["Roughness"])
+    normal_map = nodes.new('ShaderNodeNormalMap')
+    normal_map.location = (-150, -520)
+    links.new(tex("Normal", -520).outputs["Color"], normal_map.inputs["Color"])
+    links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+    if "Emission" in images:
+        links.new(tex("Emission", -800).outputs["Color"], _bsdf_input(bsdf, "Emission"))
+        bsdf.inputs["Emission Strength"].default_value = emission_strength
+    return mat
+
+
+def _emission_peak(src, cache):
+    if src.image is None:
+        return max(src.offset[:3])
+    tex = cache.get(src.image)
+    top = float(tex.data[..., :3].max()) if tex.is_float else 1.0
+    return max(s * top + o for s, o in zip(src.scale[:3], src.offset[:3]))
+
+
+def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=True, log=print):
+    """Repack every material of ``source`` into one material with texture atlases.
+
+    Returns a dict with the new object, its images and statistics.
     """
     t_start = time.time()
     _check_source(source)
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
     out_dir = _output_dir(output_dir)
+
+    warnings = []
+
+    def warn(msg):
+        if msg not in warnings:
+            warnings.append(msg)
+            log("  ! " + msg)
 
     plan = build_plan(source)
-    warning_count = 0
     for i, entry in enumerate(plan):
         for w in entry["warnings"]:
-            log(f"  [slot {i:02d}] {w}")
-            warning_count += 1
+            warn(f"slot {i:02d}: {w}")
 
-    target, default_uv = _prepare_target(source, angle_limit, island_margin, log)
-    mesh_data = _MeshData(target.data, default_uv, len(plan))
+    cache = _TextureCache()
+    loops = _MeshLoops(source.data)
+    groups = _group_slots(plan, loops, cache)
+    log(f"{len(plan)} material slot(s) -> {len(groups)} unique material(s)")
 
-    shader = _atlas_shader()
-    dummy = _dummy_texture()
-    flip = _probe_flip(shader, dummy)
+    peaks = [_emission_peak(g.sources["Emission"], cache) for g in groups]
+    has_emission = any(p > 0.0 for p in peaks)
+    emission_strength = max([1.0] + peaks)
+    if emission_strength > 1.0:
+        for g in groups:
+            g.sources["Emission"].affine(1.0 / emission_strength)
+    has_alpha = any(g.sources["Alpha"].image is not None or g.sources["Alpha"].offset[0] < 1.0
+                    for g in groups)
+    channels = ["BaseColor", "Roughness", "Metallic", "Normal"]
+    channels += ["Alpha"] if has_alpha else []
+    channels += ["Emission"] if has_emission else []
 
-    fill_idx = None
-    coverage = 0.0
-    images, paths = {}, {}
-    for channel in CHANNELS:
-        log(f"Rasterising {channel} ({resolution}x{resolution})...")
-        pixels = _render(resolution, lambda: _draw_channel(shader, dummy, mesh_data, plan, channel))
-        if flip:
-            pixels = pixels[::-1]
-        if fill_idx is None:
-            covered = pixels[..., 3] > 127
-            coverage = float(covered.mean()) * 100.0
-            log(f"  UV coverage {coverage:.1f}%; padding islands by {margin} px...")
-            fill_idx = _dilation_index(covered, margin)
-        pixels = _pad(pixels, fill_idx, _BACKGROUND[channel])
+    ctx = _Context(cache, loops.default_uv, warn)
+    flat_size = max(4, 2 * padding)
+    for g in groups:
+        g.master = _pick_master(g, cache, loops.default_uv, warn)
+        if g.master is None:  # no textures at all: one small flat block
+            chunk = _Chunk(0, 0, flat_size, flat_size)
+            chunk.make_flat(_flat_values(ctx, g, chunk, channels), flat_size)
+            g.chunks = [chunk]
+            g.loops = loops.loops_of(g.faces)[0]
+            continue
+        g.normal_rotation = _normal_rotation(g, loops.default_uv, warn)
+        _cut_chunks(g, loops, padding)
+        for chunk in g.chunks:
+            if max(chunk.w, chunk.h) > max_size:
+                chunk.base_scale = max_size / max(chunk.w, chunk.h)
+                chunk.rescale(chunk.base_scale)
+                names = ", ".join(sorted({plan[s]["material"].name for s in g.slots
+                                          if plan[s]["material"] is not None}))
+                warn(f"'{names}' needs a {chunk.w} x {chunk.h} texel region (tiled texture?), "
+                     f"larger than {max_size}; that part was scaled down to fit")
+            if chunk.aw * chunk.ah > flat_size * flat_size:
+                flat = _flat_values(ctx, g, chunk, channels)
+                if flat is not None:
+                    chunk.make_flat(flat, flat_size)
 
-        name = f"{target.name}_{channel}_{resolution}"
-        old = bpy.data.images.get(name)
-        if old is not None:
-            bpy.data.images.remove(old)
-        image = bpy.data.images.new(name, resolution, resolution, alpha=False)
-        _set_colorspace(image, channel == "BaseColor")
-        image.pixels.foreach_set((pixels.astype(np.float32) * (1.0 / 255.0)).ravel())
-        path = _store_image(image, out_dir)
-        images[channel] = image
-        if path:
-            paths[channel] = path
-            log(f"  saved {path}")
+    chunks = [c for g in groups for c in g.chunks]
+    log(f"Packing {len(chunks)} chunk(s)...")
+    size = _pack(chunks, max_size, warn, log)
+    filled = sum(c.aw * c.ah for c in chunks) / float(size * size)
 
-    _finalize_target(target, images, hide_source, source)
-    seconds = time.time() - t_start
-    log(f"Done in {seconds:.1f} s -> '{target.name}'")
-    return {"object": target, "images": images, "paths": paths, "coverage": coverage,
-            "warnings": warning_count, "seconds": seconds}
+    # New UVs: every loop moves with its chunk; nothing is re-unwrapped.
+    new_uv = np.zeros((len(source.data.loops), 2), np.float64)
+    for g in groups:
+        if g.master is None:
+            c = g.chunks[0]
+            new_uv[g.loops] = ((c.ax + c.aw / 2.0) / size, (c.ay + c.ah / 2.0) / size)
+            continue
+        p = np.array([(c.x0, c.y0, c.scale, c.ax, c.ay, c.aw, c.ah, c.flat is not None)
+                      for c in g.chunks], np.float64)[g.loop_chunk]
+        uv = ((g.loop_texel - p[:, 0:2]) * p[:, 2:3] + p[:, 3:5]) / size
+        flat = p[:, 7] > 0
+        uv[flat] = (p[flat, 3:5] + p[flat, 5:7] / 2.0) / size
+        new_uv[g.loops] = uv
 
-
-# ---------------------------------------------------------------------------
-# Cycles surface bake (alternative)
-# ---------------------------------------------------------------------------
-
-def _feed(tree, socket, target_socket, default):
-    """Connect whatever drives ``socket`` into ``target_socket`` (or copy its value)."""
-    if socket is not None and socket.is_linked:
-        tree.links.new(socket.links[0].from_socket, target_socket)
-    else:
-        value = socket.default_value if socket is not None else default
-        target_socket.default_value = _rgba(value)
-
-
-@contextmanager
-def _bake_setup(materials, image, socket_name, default):
-    """Temporarily add the bake target node to every material and, for
-    colour/data passes, route the wanted BSDF input through an Emission shader.
-    Everything is restored afterwards."""
-    added, relinks = [], []
-    try:
-        for mat in materials:
-            tree = mat.node_tree
-            node = tree.nodes.new('ShaderNodeTexImage')
-            node.image = image
-            added.append((tree, node))
-            for n in tree.nodes:
-                n.select = False
-            node.select = True
-            tree.nodes.active = node
-            if socket_name is None:
-                continue
-            out = _active_output(tree)
-            if out is None:
-                continue
-            surface = out.inputs["Surface"]
-            previous = surface.links[0].from_socket if surface.is_linked else None
-            emit = tree.nodes.new('ShaderNodeEmission')
-            added.append((tree, emit))
-            bsdf = _surface_bsdf(mat)
-            _feed(tree, bsdf.inputs[socket_name] if bsdf else None, emit.inputs["Color"], default)
-            tree.links.new(emit.outputs["Emission"], surface)
-            relinks.append((tree, surface, previous))
-        yield
-    finally:
-        for tree, node in reversed(added):
-            tree.nodes.remove(node)
-        for tree, surface, previous in relinks:
-            if previous is not None:
-                tree.links.new(previous, surface)
-
-
-def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radians(66.0),
-                      island_margin=0.005, output_dir=None, samples=8,
-                      clear_custom_normals=True, hide_source=True, log=print):
-    """Native Cycles surface bake of the same four atlases.
-
-    Base Color, Roughness and Metallic are baked through an Emission shader,
-    so metal parts do not come out black (the Diffuse Color pass multiplies
-    by 1 - metallic). The normal pass is a regular tangent-space bake.
-    """
-    t_start = time.time()
-    _check_source(source)
-    out_dir = _output_dir(output_dir)
-
-    target, default_uv = _prepare_target(source, angle_limit, island_margin, log)
+    target = _make_target(source)
     mesh = target.data
-    if clear_custom_normals and getattr(mesh, "has_custom_normals", False):
-        bpy.ops.mesh.customdata_custom_splitnormals_clear()
-        log("  cleared custom split normals on the copy")
+    for name in [l.name for l in mesh.uv_layers]:
+        mesh.uv_layers.remove(mesh.uv_layers[name])
+    layer = mesh.uv_layers.new(name=ATLAS_UV_NAME)
+    layer.data.foreach_set("uv", new_uv.astype(np.float32).ravel())
 
-    temp_materials = []
-    for slot in target.material_slots:
-        if slot.material is None or slot.material.node_tree is None:
-            temp = bpy.data.materials.new("PBR_ATLAS_TEMP")
-            if temp.node_tree is None:
-                temp.use_nodes = True
-            slot.material = temp
-            temp_materials.append(temp)
-    if not target.material_slots:
-        temp = bpy.data.materials.new("PBR_ATLAS_TEMP")
-        if temp.node_tree is None:
-            temp.use_nodes = True
-        mesh.materials.append(temp)
-        temp_materials.append(temp)
-    materials = list({s.material.name: s.material for s in target.material_slots}.values())
+    # Build each atlas and compress it to PNG on worker threads (zlib runs in
+    # parallel) while the next atlas is being assembled.
+    jobs = []
+    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+        for name, color, alpha in _OUTPUTS:
+            if color not in channels:
+                continue
+            log(f"Writing {name} atlas ({size} x {size})...")
+            atlas = np.empty((size, size, 4), np.uint8)
+            atlas[..., :3] = _BACKGROUND[name]
+            atlas[..., 3] = 255
+            use_alpha = alpha is not None and has_alpha
+            for g in groups:
+                for c in g.chunks:
+                    region = atlas[c.ay:c.ay + c.ah, c.ax:c.ax + c.aw]
+                    region[..., :3] = _block(ctx, g, c, color)
+                    if use_alpha:
+                        region[..., 3] = _block(ctx, g, c, alpha)[..., 0]
+            jobs.append((name, color, pool.submit(_png_bytes, atlas, use_alpha)))
+            del atlas
 
-    scene = bpy.context.scene
-    saved = (scene.render.engine, scene.cycles.samples, scene.cycles.device)
-    scene.render.engine = 'CYCLES'
-    scene.cycles.samples = samples
-    try:
-        if bpy.context.preferences.addons["cycles"].preferences.has_active_device():
-            scene.cycles.device = 'GPU'
-    except (KeyError, AttributeError):
-        pass
-
-    images, paths = {}, {}
-    try:
-        for channel in CHANNELS:
-            log(f"Baking {channel} with Cycles ({resolution}x{resolution})...")
-            name = f"{target.name}_{channel}_{resolution}"
-            old = bpy.data.images.get(name)
-            if old is not None:
-                bpy.data.images.remove(old)
-            image = bpy.data.images.new(name, resolution, resolution, alpha=False)
-            _set_colorspace(image, channel == "BaseColor")
-            is_normal = channel == "Normal"
-            with _bake_setup(materials, image, None if is_normal else _SOCKETS[channel],
-                             _DEFAULTS[channel]):
-                bpy.ops.object.bake(
-                    type='NORMAL' if is_normal else 'EMIT',
-                    use_selected_to_active=False,  # surface bake: no rays between objects
-                    margin=margin, margin_type='EXTEND', use_clear=True,
-                    target='IMAGE_TEXTURES', uv_layer=BAKE_UV_NAME, normal_space='TANGENT')
-            path = _store_image(image, out_dir)
-            images[channel] = image
+        images, paths = {}, {}
+        for name, color, job in jobs:
+            png = job.result()
+            path = os.path.join(out_dir, f"{target.name}_{name}_{size}.png") if out_dir else None
             if path:
-                paths[channel] = path
+                with open(path, "wb") as fh:
+                    fh.write(png)
+                paths[name] = path
                 log(f"  saved {path}")
-    finally:
-        scene.render.engine, scene.cycles.samples, scene.cycles.device = saved
+            images[name] = _packed_image(f"{target.name}_{name}_{size}", png,
+                                         color in _COLOR_CHANNELS, path)
 
-    _finalize_target(target, images, hide_source, source)
-    for temp in temp_materials:
-        if temp.users == 0:
-            bpy.data.materials.remove(temp)
+    for slot in target.material_slots:
+        slot.link = 'DATA'
+    mesh.materials.clear()
+    mesh.materials.append(_master_material(f"M_{target.name}", images, has_alpha, emission_strength))
+    mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), np.int32))
+    mesh.update()
+
+    if hide_source:
+        source.hide_set(True)
+    for obj in list(bpy.context.selected_objects):
+        obj.select_set(False)
+    target.hide_set(False)
+    target.select_set(True)
+    bpy.context.view_layer.objects.active = target
+
     seconds = time.time() - t_start
-    log(f"Done in {seconds:.1f} s -> '{target.name}'")
-    return {"object": target, "images": images, "paths": paths, "coverage": None,
-            "warnings": 0, "seconds": seconds}
+    flat_count = sum(c.flat is not None for c in chunks)
+    log(f"Done in {seconds:.1f} s: {size} x {size} atlas, {len(chunks)} chunk(s) "
+        f"({flat_count} flat), {filled:.0%} filled -> '{target.name}'")
+    return {"object": target, "images": images, "paths": paths, "size": size,
+            "groups": len(groups), "chunks": len(chunks), "flat_chunks": flat_count,
+            "filled": filled, "warnings": len(warnings), "seconds": seconds}
 
 
 # ---------------------------------------------------------------------------
@@ -1205,23 +1445,14 @@ def bake_cycles_atlas(source, resolution=4096, margin=16, angle_limit=math.radia
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    OBJECT_NAME = ""                   # "" = the active object, e.g. "guitar.036"
-    METHOD = "GPU"                     # "GPU" or "CYCLES"
-    RESOLUTION = 4096                  # 1024, 2048, 4096 or 8192
-    MARGIN = 16                        # edge padding in pixels
-    ANGLE_LIMIT_DEGREES = 66.0         # Smart UV Project angle limit
-    ISLAND_MARGIN = 0.005              # space between UV islands (0..1 UV units)
-    OUTPUT_DIR = None                  # None = textures only inside the .blend;
-                                       # or a folder for PNG copies, e.g. "//atlas_textures/"
-    DIAGNOSE_ONLY = False              # True = only write the report
+    OBJECT_NAME = ""        # "" = the active object, e.g. "guitar.036"
+    MAX_ATLAS_SIZE = 8192   # the smallest power of two that fits is used, up to this
+    PADDING = 8             # texels of real texture kept around every UV island
+    OUTPUT_DIR = None       # None = textures only inside the .blend;
+                            # or a folder for PNG copies, e.g. "//atlas_textures/"
+    DIAGNOSE_ONLY = False   # True = only write the report
 
     source_obj = bpy.data.objects.get(OBJECT_NAME) if OBJECT_NAME else bpy.context.active_object
     print(write_report(source_obj))
     if not DIAGNOSE_ONLY:
-        options = dict(resolution=RESOLUTION, margin=MARGIN,
-                       angle_limit=math.radians(ANGLE_LIMIT_DEGREES),
-                       island_margin=ISLAND_MARGIN, output_dir=OUTPUT_DIR)
-        if METHOD.upper() == "CYCLES":
-            bake_cycles_atlas(source_obj, **options)
-        else:
-            bake_gpu_atlas(source_obj, **options)
+        build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR)
