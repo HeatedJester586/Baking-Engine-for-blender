@@ -220,6 +220,9 @@ def build_scene():
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
 
+    def srgb_decode(v):
+        return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+
     srgb = lambda v: int(round(float(baker._linear_to_srgb(np.float64(v))) * 255))
     lin = lambda v: int(round(v * 255))
     flat_normal = (128, 128, 255)
@@ -244,10 +247,11 @@ def build_scene():
     # is compared against a smooth sample of the source with a small tolerance.
     expect[8] = {"BaseColor": ("tex", px["mixed_base"], [0, 1, 2], 1),
                  "Roughness": ("smooth", px["ramp"], [0], 1)}
-    # Raw texel values, even though the data maps are tagged sRGB.
+
     expect[9] = {"BaseColor": ("tex", px["whammy_base"], [0, 1, 2], 1),
-                 "Roughness": ("tex", px["whammy_rough"], [0], 1),
-                 "Metallic": ("tex", px["whammy_metal"], [0], 1),
+                 # sRGB-tagged data maps look like Blender renders them (gamma-decoded)
+                 "Roughness": ("map", px["whammy_rough"], [0], srgb_decode),
+                 "Metallic": ("map", px["whammy_metal"], [0], srgb_decode),
                  "Normal": ("tex", px["whammy_normal"], [0, 1, 2], 1)}
     # Displacement: (0, 1) and (0.5, 0.1) share one Displacement node whose range
     # covers both: scale 1.05, midlevel 0.05 / 1.05.
@@ -256,7 +260,8 @@ def build_scene():
     expect[10] = {"BaseColor": ("tex", px["knob_base"], [0, 1, 2], 1),
                   "Height": ("map", px["knob_height"], [0], lambda h: (h - 0.5) * 0.1 / scale + mid)}
     expect[0]["Height"] = int(round(mid * 255))
-    expect[11] = {"Roughness": ("map", px["ramp_rough"], [0], lambda h: 0.8 - 0.7 * h)}
+    # The ramp's texture is tagged sRGB, so Blender decodes it before the ramp.
+    expect[11] = {"Roughness": ("map", px["ramp_rough"], [0], lambda h: 0.8 - 0.7 * srgb_decode(h))}
     return obj, expect
 
 

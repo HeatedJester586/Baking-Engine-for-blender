@@ -516,8 +516,8 @@ def _check_colorspace(channel, src, warn):
         warn(f"{channel} image '{src.image.name}' is set to Non-Color", note=True)
     elif channel not in _COLOR_CHANNELS and channel != "Alpha" and not data:
         warn(f"{channel} image '{src.image.name}' is tagged "
-             f"'{src.image.colorspace_settings.name}'; its raw values are used, like a game "
-             "engine would (the atlas is Non-Color)", note=True)
+             f"'{src.image.colorspace_settings.name}', so Blender gamma-decodes it; the atlas "
+             "keeps that look (enable 'Raw Data Maps' for the raw values)", note=True)
 
 
 def _resolve_displacement(material, warn):
@@ -1212,7 +1212,7 @@ def _encode(values, kind, rotation=None, strength=1.0):
     return np.rint(np.clip(values, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def _verbatim_channels(src, tex, kind, rotation):
+def _verbatim_channels(src, tex, kind, rotation, decode=True):
     """Texel channels that can be copied byte for byte, or None when a
     conversion is needed (colour space, factor math, normal strength...)."""
     if tex.is_float or src.ramp is not None:
@@ -1229,7 +1229,7 @@ def _verbatim_channels(src, tex, kind, rotation):
     if len(hot) != 1 or src.mask[hot[0]] != 1.0 or src.scale[0] != 1.0 or src.offset[0] != 0.0:
         return None
     k = hot[0]
-    if kind == "linear":
+    if kind == "linear" and (k == 3 or not (decode and tex.srgb)):
         return [k]
     if kind == "srgb" and k < 3 and tex.srgb:
         return [k, k, k]
@@ -1265,7 +1265,10 @@ def _block(ctx, group, chunk, channel):
         return np.broadcast_to(chunk.flat[channel], shape)
     src = group.sources[channel]
     rotation = group.normal_rotation if channel == "Normal" else None
-    decode = kind == "srgb"  # only colour maps are colour managed
+    # Colour maps are always colour managed. Data maps tagged sRGB are decoded
+    # too, like Blender renders them, unless raw values were asked for.
+    # Normal maps are always read raw (tangent-space vectors).
+    decode = kind == "srgb" or (kind == "linear" and not ctx.raw_data)
     strength = src.strength if channel == "Normal" else 1.0
     if src.image is None:
         value = np.asarray(src.offset[:shape[2]], np.float32).reshape(1, 1, -1)
@@ -1279,7 +1282,7 @@ def _block(ctx, group, chunk, channel):
                  and np.allclose(_affine2x3(src.uv_affine), master.affine))
     if same_grid:
         raw = tex.block(chunk.x0, chunk.y0, chunk.w, chunk.h, src.wrap)
-        channels = _verbatim_channels(src, tex, kind, rotation)
+        channels = _verbatim_channels(src, tex, kind, rotation, decode)
         if channels == [0, 1, 2]:
             return raw[..., :3]
         if channels is not None:
@@ -1308,8 +1311,9 @@ def _flat_values(ctx, group, chunk, channels):
 
 
 class _Context:
-    def __init__(self, cache, default_uv, warn):
+    def __init__(self, cache, default_uv, warn, raw_data=False):
         self.cache, self.default_uv, self.warn = cache, default_uv, warn
+        self.raw_data = raw_data
 
 
 # ---------------------------------------------------------------------------
@@ -1533,12 +1537,14 @@ def _room_report(groups, plan, size_limit):
 
 
 def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
-                lossless=True, log=print):
+                lossless=True, raw_data=False, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
 
     ``max_size`` 0 means Auto: the smallest power of two that holds every
     texel, up to AUTO_SIZE_LIMIT. With ``lossless`` nothing is ever scaled
-    down; if the textures do not fit, a RuntimeError explains why.
+    down; if the textures do not fit, a RuntimeError explains why. Roughness,
+    Metallic, Alpha and Height maps tagged sRGB are gamma-decoded like Blender
+    renders them, unless ``raw_data`` is set (game-engine style).
 
     Returns a dict with the new object, its images and statistics.
     """
@@ -1603,7 +1609,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
         _BACKGROUND["Height"] = (int(round(min(max(mid, 0.0), 1.0) * 255)),) * 3
         channels.append("Height")
 
-    ctx = _Context(cache, loops.default_uv, warn)
+    ctx = _Context(cache, loops.default_uv, warn, raw_data)
     flat_size = max(4, 2 * padding)
     for g in groups:
         g.master = _pick_master(g, cache, loops.default_uv, warn)
@@ -1724,6 +1730,7 @@ if __name__ == "__main__":
     OBJECT_NAME = ""        # "" = the active object, e.g. "guitar.036"
     MAX_ATLAS_SIZE = 0      # 0 = Auto; else the smallest power of two that fits, up to this
     LOSSLESS = True         # never shrink textures; stop with an explanation instead
+    RAW_DATA = False        # True = sRGB-tagged roughness/metallic maps keep raw values
     PADDING = 8             # texels of real texture kept around every UV island
     OUTPUT_DIR = None       # None = textures only inside the .blend;
                             # or a folder for PNG copies, e.g. "//atlas_textures/"
@@ -1733,4 +1740,4 @@ if __name__ == "__main__":
     print(write_report(source_obj))
     if not DIAGNOSE_ONLY:
         build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR,
-                    lossless=LOSSLESS)
+                    lossless=LOSSLESS, raw_data=RAW_DATA)

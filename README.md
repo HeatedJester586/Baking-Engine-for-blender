@@ -37,9 +37,12 @@ repacked texel for texel**:
   (Separate Color R/G/B), Color Ramps (evaluated exactly), Mapping nodes
   (tiling), UV Map nodes, the glTF importer's Mix/Math "factor" nodes,
   Invert, Normal Map strength, reroutes and muted nodes.
-- **Correct colour.** Base Color and Emission atlases are sRGB, data maps
-  are Non-Color. Roughness, Metallic and Normal textures are always read
-  as raw values (like a game engine), even if they are tagged sRGB.
+- **Looks like the original.** Base Color and Emission atlases are sRGB,
+  data maps are Non-Color. Roughness / Metallic / Height textures left on
+  sRGB are gamma-decoded exactly like Blender renders them, so the atlas
+  looks the same as the original materials. Tick **Raw Data Maps** to keep
+  their raw values instead (game-engine style). Normal maps are always read
+  raw.
 - **Game-rip friendly.** A normal texture plugged straight into Normal
   (without a Normal Map node) is treated as a tangent-space normal map.
 - **Padding** of real neighbouring texels around every island, so
@@ -104,6 +107,7 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 |---|---|---|
 | Atlas Size | Auto | Auto picks the smallest power of two that keeps every texel (up to 16384). A number caps the size. |
 | Lossless | on | Never shrink anything. If the textures do not fit, stop and list which materials need the room. |
+| Raw Data Maps | off | Off: sRGB-tagged roughness/metallic/height look exactly like in Blender. On: keep their raw values. |
 | Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
 | Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |

@@ -21,6 +21,11 @@ class PBRAtlasSettings(bpy.types.PropertyGroup):
         description="Never shrink textures. If they do not fit, stop and explain which "
                     "materials need the room instead of lowering quality",
     )
+    raw_data: BoolProperty(
+        name="Raw Data Maps", default=False,
+        description="Roughness / Metallic / Height textures tagged sRGB keep their raw values "
+                    "(like a game engine). Off: they look exactly like in Blender",
+    )
     padding: IntProperty(
         name="Padding", subtype='PIXEL', default=8, min=0, max=64,
         description="Texels of real texture kept around every UV island, so mipmaps do not bleed",
@@ -89,6 +94,7 @@ class PBRATLAS_OT_build(bpy.types.Operator):
                 _active_mesh(context),
                 max_size=0 if settings.max_size == 'AUTO' else int(settings.max_size),
                 lossless=settings.lossless,
+                raw_data=settings.raw_data,
                 padding=settings.padding,
                 output_dir=settings.output_dir if settings.save_files else None,
                 hide_source=settings.hide_source,
@@ -128,6 +134,7 @@ class PBRATLAS_PT_panel(bpy.types.Panel):
 
         layout.prop(settings, "max_size")
         layout.prop(settings, "lossless")
+        layout.prop(settings, "raw_data")
         layout.prop(settings, "padding")
         layout.prop(settings, "hide_source")
         layout.prop(settings, "save_files")
