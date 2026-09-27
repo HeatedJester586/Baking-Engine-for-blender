@@ -34,16 +34,20 @@ class PBRAtlasSettings(bpy.types.PropertyGroup):
     )
 
 
+# Last "Check Materials" result, shown in the Material Check panel.
+_CHECK = {"object": None, "rows": []}
+
+
 def _active_mesh(context):
     obj = context.active_object
     return obj if obj is not None and obj.type == 'MESH' else None
 
 
-class PBRATLAS_OT_diagnose(bpy.types.Operator):
-    """Write a report of every material slot and where each PBR channel comes from"""
+class PBRATLAS_OT_check(bpy.types.Operator):
+    """List every material slot and what is plugged into each channel (also written to the Text Editor)"""
 
-    bl_idname = "pbr_atlas.diagnose"
-    bl_label = "Diagnose Materials"
+    bl_idname = "pbr_atlas.check"
+    bl_label = "Check Materials"
 
     @classmethod
     def poll(cls, context):
@@ -51,11 +55,13 @@ class PBRATLAS_OT_diagnose(bpy.types.Operator):
 
     def execute(self, context):
         obj = _active_mesh(context)
-        report = baker.write_report(obj)
-        print(report)
-        warnings = sum(len(e["warnings"]) for e in baker.build_plan(obj))
+        rows = baker.check_materials(obj)
+        _CHECK["object"], _CHECK["rows"] = obj.name, rows
+        print(baker.write_report(obj))
+        warnings = sum(len(r["warnings"]) for r in rows)
         level = {'WARNING'} if warnings else {'INFO'}
-        self.report(level, f"{warnings} warning(s). Full report in Text Editor: {baker.REPORT_TEXT}")
+        self.report(level, f"{len(rows)} material slot(s), {warnings} warning(s). "
+                           f"Full report in Text Editor: {baker.REPORT_TEXT}")
         return {'FINISHED'}
 
 
@@ -120,11 +126,60 @@ class PBRATLAS_PT_panel(bpy.types.Panel):
             layout.prop(settings, "output_dir")
 
         layout.separator()
-        layout.operator(PBRATLAS_OT_diagnose.bl_idname, icon='VIEWZOOM')
+        layout.operator(PBRATLAS_OT_check.bl_idname, icon='VIEWZOOM')
         layout.operator(PBRATLAS_OT_build.bl_idname, icon='TEXTURE')
 
 
-_CLASSES = (PBRAtlasSettings, PBRATLAS_OT_diagnose, PBRATLAS_OT_build, PBRATLAS_PT_panel)
+class PBRATLAS_PT_check(bpy.types.Panel):
+    bl_label = "Material Check"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Atlas"
+    bl_parent_id = "PBRATLAS_PT_panel"
+
+    def draw(self, context):
+        layout = self.layout
+        rows = _CHECK["rows"]
+        if not rows:
+            layout.label(text="Click Check Materials to list them", icon='INFO')
+            return
+        emitting = sum(r["emission"] is not None for r in rows)
+        displaced = sum(r["displacement"] is not None for r in rows)
+        warnings = sum(len(r["warnings"]) for r in rows)
+        col = layout.column(align=True)
+        col.label(text=f"'{_CHECK['object']}': {len(rows)} slot(s)", icon='OBJECT_DATA')
+        col.label(text=f"{emitting} with emission, {displaced} with displacement", icon='LIGHT')
+        if warnings:
+            col.label(text=f"{warnings} warning(s)", icon='ERROR')
+
+        for row in rows:
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text=f"{row['name']}  ({row['faces']} faces)", icon='MATERIAL')
+            for label, text in row["textures"]:
+                col.label(text=f"{label}: {text}", icon='TEXTURE')
+            if row["emission"] is not None:
+                col.label(text=f"Emission: {row['emission']}", icon='LIGHT')
+            if row["displacement"] is not None:
+                col.label(text=f"Displacement: {row['displacement']}", icon='MOD_DISPLACE')
+            if row["constants"]:
+                text = ", ".join(f"{label} {value}" for label, value in row["constants"])
+                col.label(text=f"Values: {text}", icon='COLOR')
+            flags = []
+            if row["emission"] is None:
+                flags.append("no emission")
+            if row["displacement"] is None:
+                flags.append("no displacement")
+            if flags:
+                col.label(text=", ".join(flags).capitalize(), icon='BLANK1')
+            for warning in row["warnings"]:
+                sub = col.row()
+                sub.alert = True
+                sub.label(text=warning, icon='ERROR')
+
+
+_CLASSES = (PBRAtlasSettings, PBRATLAS_OT_check, PBRATLAS_OT_build, PBRATLAS_PT_panel,
+            PBRATLAS_PT_check)
 
 
 def register():

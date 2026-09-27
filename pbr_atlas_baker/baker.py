@@ -37,7 +37,7 @@ import bpy
 import numpy as np
 from mathutils import Euler, Matrix, Vector
 
-CHANNELS = ("BaseColor", "Alpha", "Roughness", "Metallic", "Normal", "Emission")
+CHANNELS = ("BaseColor", "Alpha", "Roughness", "Metallic", "Normal", "Emission", "Height")
 ATLAS_UV_NAME = "UV_Atlas"
 TARGET_SUFFIX = "_ATLAS"
 MARKER = "pbr_atlas_baker"  # custom property set on objects this tool creates
@@ -58,11 +58,12 @@ _DEFAULTS = {
     "Metallic": (0.0, 0.0, 0.0, 1.0),
     "Normal": (0.5, 0.5, 1.0, 1.0),
     "Emission": (0.0, 0.0, 0.0, 1.0),
+    "Height": (0.0, 0.0, 0.0, 1.0),
 }
-_SCALAR_CHANNELS = ("Alpha", "Roughness", "Metallic")
+_SCALAR_CHANNELS = ("Alpha", "Roughness", "Metallic", "Height")
 _COLOR_CHANNELS = ("BaseColor", "Emission")
 # How each channel is stored in its atlas.
-_KIND = {"BaseColor": "srgb", "Emission": "srgb", "Normal": "normal",
+_KIND = {"BaseColor": "srgb", "Emission": "srgb", "Normal": "normal", "Height": "linear",
          "Alpha": "linear", "Roughness": "linear", "Metallic": "linear"}
 # Atlas textures: (name, channel for RGB, channel for alpha)
 _OUTPUTS = (
@@ -71,6 +72,7 @@ _OUTPUTS = (
     ("Metallic", "Metallic", None),
     ("Normal", "Normal", None),
     ("Emission", "Emission", None),
+    ("Height", "Height", None),
 )
 # 8-bit fill for atlas texels that no chunk covers.
 _BACKGROUND = {
@@ -79,6 +81,7 @@ _BACKGROUND = {
     "Metallic": (0, 0, 0),
     "Normal": (128, 128, 255),
     "Emission": (0, 0, 0),
+    "Height": (0, 0, 0),  # replaced by the displacement midlevel
 }
 _ATLAS_SIZES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 _MISSING_TEXTURE = (1.0, 0.0, 1.0, 1.0)  # Blender's pink "missing image" colour
@@ -485,6 +488,32 @@ def _check_colorspace(channel, src, warn):
              "engine would (the atlas is Non-Color)")
 
 
+def _resolve_displacement(material, warn):
+    """Height source wired into the Material Output's Displacement, and its
+    (midlevel, scale). ``(constant 0, None)`` when nothing is connected."""
+    none = ChannelSource(_DEFAULTS["Height"])
+    tree = getattr(material, "node_tree", None)
+    out = _active_output(tree) if tree is not None else None
+    socket = out.inputs.get("Displacement") if out is not None else None
+    if socket is None:
+        return none, None
+    node, _ = _upstream(socket)
+    if node is None:
+        return none, None
+    if node.type == 'DISPLACEMENT':
+        for name in ("Midlevel", "Scale"):
+            if node.inputs[name].is_linked:
+                warn(f"Displacement '{node.name}' has a linked {name}; its default value is used")
+        src = _resolve(node.inputs["Height"], warn).to_scalar()
+        return src, (round(node.inputs["Midlevel"].default_value, 6),
+                     round(node.inputs["Scale"].default_value, 6))
+    if node.type == 'VECTOR_DISPLACEMENT':
+        warn(f"Vector Displacement '{node.name}' is not supported; displacement ignored")
+        return none, None
+    # A texture wired straight into the Displacement output: used as height.
+    return _resolve(socket, warn).to_scalar(), (0.0, 1.0)
+
+
 def build_plan(obj):
     """Work out, for every material slot, where each PBR channel comes from.
 
@@ -513,8 +542,11 @@ def build_plan(obj):
                      "using it anyway")
 
         sources = {}
+        height, displacement = _resolve_displacement(material, warn)
         for channel in CHANNELS:
-            if bsdf is None:
+            if channel == "Height":
+                src = height
+            elif bsdf is None:
                 src = ChannelSource(_DEFAULTS[channel])
             elif channel == "Normal":
                 src = _resolve_normal(bsdf.inputs["Normal"], warn)
@@ -532,7 +564,8 @@ def build_plan(obj):
             src.simplify()
             _check_colorspace(channel, src, warn)
             sources[channel] = src
-        plan.append({"material": material, "sources": sources, "warnings": warnings})
+        plan.append({"material": material, "sources": sources, "warnings": warnings,
+                     "displacement": displacement})
     return plan
 
 
@@ -650,6 +683,57 @@ def diagnose(obj):
         lines.append("-" * 72)
     lines.append(f"{total_warnings} warning(s).")
     return "\n".join(lines)
+
+
+_LABELS = {"BaseColor": "Base Color", "Alpha": "Alpha", "Roughness": "Roughness",
+           "Metallic": "Metallic", "Normal": "Normal", "Emission": "Emission",
+           "Height": "Displacement"}
+
+
+def _short(src):
+    if src.image is None:
+        r, g, b, _ = src.offset
+        return f"{r:.2f}" if abs(r - g) < 1e-6 and abs(g - b) < 1e-6 else f"({r:.2f}, {g:.2f}, {b:.2f})"
+    text = src.image.name
+    if src.mask is not None:
+        picks = [c for c, w in zip("RGBA", src.mask) if w]
+        text += f" [{picks[0]}]" if len(picks) == 1 else ""
+    return text
+
+
+def check_materials(obj):
+    """What every material slot feeds into each channel, for the UI checker.
+
+    Returns a list of dicts: ``name``, ``faces``, ``textures`` [(label, text)],
+    ``constants`` [(label, text)], ``emission`` and ``displacement`` (text or
+    None) and ``warnings``.
+    """
+    mesh = obj.data
+    plan = build_plan(obj)
+    face_mat = np.empty(len(mesh.polygons), np.int32)
+    mesh.polygons.foreach_get("material_index", face_mat)
+    counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
+    rows = []
+    for i, entry in enumerate(plan):
+        mat, sources = entry["material"], entry["sources"]
+        textures, constants = [], []
+        for channel in ("BaseColor", "Alpha", "Roughness", "Metallic", "Normal"):
+            src = sources[channel]
+            text = "flat" if channel == "Normal" and src.image is None else _short(src)
+            (textures if src.image is not None else constants).append((_LABELS[channel], text))
+        emission = sources["Emission"]
+        emits = emission.image is not None or any(emission.offset[:3])
+        height = sources["Height"]
+        rows.append({
+            "name": f"{i:02d}  {mat.name if mat else '<empty slot>'}",
+            "faces": int(counts[i]),
+            "textures": textures,
+            "constants": constants,
+            "emission": _short(emission) if emits else None,
+            "displacement": _short(height) if entry["displacement"] is not None else None,
+            "warnings": list(entry["warnings"]),
+        })
+    return rows
 
 
 def write_report(obj):
@@ -859,6 +943,7 @@ class _Group:
         self.loop_texel = None  # per loop: position on the master texel grid
         self.loop_chunk = None  # per loop: index into self.chunks
         self.normal_rotation = None
+        self.displacement = None  # (midlevel, scale) of its Displacement, if any
 
 
 def _group_slots(plan, loops, cache):
@@ -869,7 +954,9 @@ def _group_slots(plan, loops, cache):
         if not faces.size:
             continue
         key = tuple(entry["sources"][ch].key(cache.key, loops.default_uv) for ch in CHANNELS)
+        key += (entry["displacement"],)
         group = groups.setdefault(key, _Group(entry["sources"]))
+        group.displacement = entry["displacement"]
         group.slots.append(slot)
         group.faces.append(faces)
     for group in groups.values():
@@ -1261,7 +1348,7 @@ def _packed_image(name, png, is_color, path=None):
     return image
 
 
-def _master_material(name, images, has_alpha, emission_strength):
+def _master_material(name, images, has_alpha, emission_strength, displacement=None):
     mat = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     if mat.node_tree is None:
         mat.use_nodes = True
@@ -1294,6 +1381,12 @@ def _master_material(name, images, has_alpha, emission_strength):
     if "Emission" in images:
         links.new(tex("Emission", -800).outputs["Color"], _bsdf_input(bsdf, "Emission"))
         bsdf.inputs["Emission Strength"].default_value = emission_strength
+    if "Height" in images and displacement is not None:
+        disp = nodes.new('ShaderNodeDisplacement')
+        disp.location = (100, -500)
+        disp.inputs["Midlevel"].default_value, disp.inputs["Scale"].default_value = displacement
+        links.new(tex("Height", -1080).outputs["Color"], disp.inputs["Height"])
+        links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
     return mat
 
 
@@ -1344,6 +1437,29 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
     channels = ["BaseColor", "Roughness", "Metallic", "Normal"]
     channels += ["Alpha"] if has_alpha else []
     channels += ["Emission"] if has_emission else []
+
+    # Displacement: one Displacement node drives the atlas. Each material moves
+    # the surface by (height - midlevel) * scale; pick one (midlevel, scale)
+    # whose 0..1 range covers every material, and re-express each height in it.
+    # With identical settings everywhere this changes nothing.
+    params = {g.displacement for g in groups if g.displacement is not None}
+    ends = [e for m, sc in params for e in (-m * sc, (1.0 - m) * sc)]
+    displacement = None
+    if ends and max(ends) > min(ends):
+        scale = max(ends) - min(ends)
+        mid = -min(ends) / scale
+        if len(params) == 1:
+            mid, scale = next(iter(params))
+        displacement = (mid, scale)
+        for g in groups:
+            if g.displacement is None:
+                g.sources["Height"] = ChannelSource((mid, mid, mid, 1.0))
+            elif g.displacement != displacement:
+                m1, s1 = g.displacement
+                k = s1 / scale
+                g.sources["Height"].affine(k, mid - m1 * k)
+        _BACKGROUND["Height"] = (int(round(min(max(mid, 0.0), 1.0) * 255)),) * 3
+        channels.append("Height")
 
     ctx = _Context(cache, loops.default_uv, warn)
     flat_size = max(4, 2 * padding)
@@ -1432,7 +1548,8 @@ def build_atlas(source, max_size=8192, padding=8, output_dir=None, hide_source=T
     for slot in target.material_slots:
         slot.link = 'DATA'
     mesh.materials.clear()
-    mesh.materials.append(_master_material(f"M_{target.name}", images, has_alpha, emission_strength))
+    mesh.materials.append(_master_material(f"M_{target.name}", images, has_alpha,
+                                           emission_strength, displacement))
     mesh.polygons.foreach_set("material_index", np.zeros(len(mesh.polygons), np.int32))
     mesh.update()
 

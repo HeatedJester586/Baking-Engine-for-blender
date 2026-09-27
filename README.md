@@ -2,7 +2,7 @@
 
 Combine **every material of a mesh into one material** with one set of
 square PBR texture atlases: Base Color (+ Alpha), Roughness, Metallic,
-Normal and Emission.
+Normal, Emission and Height (displacement).
 
 No baking, no ray tracing, no re-unwrapping. The textures are **cut and
 repacked texel for texel**:
@@ -44,9 +44,14 @@ repacked texel for texel**:
   (without a Normal Map node) is treated as a tangent-space normal map.
 - **Padding** of real neighbouring texels around every island, so
   mipmaps do not bleed.
-- **Diagnostics report** that lists, for every slot, which image and channel
-  each input comes from, with warnings for missing files, unsupported nodes
-  and wrong colour spaces.
+- **Material checker.** *Check Materials* lists every slot in the panel:
+  which textures feed Base Color, Alpha, Roughness, Metallic and Normal,
+  which materials have emission or displacement, and any warnings (missing
+  files, unsupported nodes). A full report also goes to the Text Editor.
+- **Displacement.** Textures wired into the Material Output's Displacement,
+  directly or through a Displacement node, are packed into a Height atlas
+  that drives one Displacement node. Materials without displacement stay
+  flat; different midlevel/scale settings are converted exactly.
 - Keeps custom split normals and every other mesh attribute.
 
 ## Installation
@@ -64,8 +69,9 @@ Requires **Blender 4.2 or newer**. The automated tests run on Blender 5.0.
 ## Usage
 
 1. Select the mesh (for example `guitar.036`).
-2. Optional: click **Diagnose Materials** and check the report in the Text
-   Editor (`PBR_ATLAS_REPORT.txt`).
+2. Optional: click **Check Materials** and look through the **Material
+   Check** list in the panel (full report: `PBR_ATLAS_REPORT.txt` in the Text
+   Editor).
 3. Click **Build Atlas**.
 
 You get a new object `<name>_ATLAS` with one UV map (`UV_Atlas`) and one
@@ -78,6 +84,7 @@ material (`M_<name>_ATLAS`):
 | `<name>_ATLAS_Metallic_<size>` | Non-Color | Metallic |
 | `<name>_ATLAS_Normal_<size>` | Non-Color, OpenGL (+Y) | Normal Map > Normal |
 | `<name>_ATLAS_Emission_<size>` (only if something glows) | sRGB | Emission Color |
+| `<name>_ATLAS_Height_<size>` (only if something is displaced) | Non-Color | Displacement node > Material Output |
 
 Nothing is written to disk unless you tick **Also Save PNG Files**. To
 export later, use *Image > Save As* in the Image Editor or
