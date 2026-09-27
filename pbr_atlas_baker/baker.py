@@ -584,6 +584,15 @@ def build_plan(obj, direct_normals=True):
 
         sources = {}
         height, displacement = _resolve_displacement(material, warn)
+        # A texture wired straight into Normal replaces the shading normal, so
+        # Blender throws away the displacement bump for this material. When the
+        # atlas copies the original look, leave that displacement out too.
+        normal_node = _upstream(bsdf.inputs["Normal"])[0] if bsdf is not None else None
+        overridden = normal_node is not None and normal_node.type not in ('NORMAL_MAP', 'BUMP')
+        if overridden and displacement is not None and not direct_normals:
+            warn("its displacement does not show in Blender because a texture is plugged "
+                 "straight into Normal; it is left out to match the original", note=True)
+            height, displacement = ChannelSource(_DEFAULTS["Height"]), None
         for channel in CHANNELS:
             if channel == "Height":
                 src = height

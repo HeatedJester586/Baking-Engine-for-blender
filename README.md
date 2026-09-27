@@ -47,7 +47,8 @@ repacked texel for texel**:
   (without a Normal Map node) is used as a real tangent-space normal map.
   Blender itself does not do that, so the original shows much less bump
   detail; untick **Use Unwired Normal Maps** to leave those textures out
-  and match the original look.
+  and match the original look. Such a texture also makes Blender ignore
+  that material's displacement bump, so its displacement is left out too.
 - **Padding** of real neighbouring texels around every island, so
   mipmaps do not bleed.
 - **Material checker.** *Check Materials* lists every slot in the panel:

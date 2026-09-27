@@ -290,6 +290,10 @@ def main():
                 and [i for i, r in enumerate(rows) if r["displacement"]] == [9, 10]
                 and ("Normal", "TEX_Guitar_02_Normal") in rows[9]["textures"],
                 "material checker lists textures, emission and displacement per slot")
+    original_look = baker.check_materials(source, direct_normals=False)
+    ok &= check(original_look[9]["displacement"] is None and rows[9]["displacement"] is not None
+                and original_look[10]["displacement"] is not None,
+                "unwired normal hides that material's displacement when matching the original")
     ok &= check(not rows[9]["warnings"] and any("repeat" in w for w in rows[6]["warnings"]),
                 "handled cases are notes, texture tiling is a warning")
 
