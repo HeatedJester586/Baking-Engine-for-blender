@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "pbr_atlas_baker"
+version = "1.0.0"
+name = "PBR Atlas Baker"
+tagline = "Merge every material of a mesh into one set of PBR atlases"
+maintainer = "HeatedJester586"
+type = "add-on"
+website = "https://github.com/HeatedJester586/Baking-Engine-for-blender"
+tags = ["Bake", "Material", "UV"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Writes the baked texture atlases (PNG) to disk"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc"]

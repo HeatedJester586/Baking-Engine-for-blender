@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Build output
+dist/
+*.zip
+
+# Blender
+*.blend1
+*.blend2
+atlas_textures/
