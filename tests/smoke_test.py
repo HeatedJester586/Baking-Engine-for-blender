@@ -151,6 +151,8 @@ def build_scene():
     quad([(-2, 1.2, 0), (-1, 1.2, 0), (-1, 2.2, 0), (-2, 2.2, 0)], square, 4)    # empty slot
     bm.to_mesh(mesh)
     bm.free()
+    for i in range(7):  # fill Blender's 8 UV map limit with unused maps, like many game rips
+        mesh.uv_layers.new(name=f"UV_unused_{i}")
 
     obj = bpy.data.objects.new("guitar.036", mesh)
     bpy.context.scene.collection.objects.link(obj)
@@ -192,6 +194,7 @@ def main():
     ok &= check(len(target.material_slots) == 1, "atlas object has one material")
     ok &= check([l.name for l in target.data.uv_layers] == [baker.BAKE_UV_NAME],
                 "atlas object keeps only the atlas UV map")
+    ok &= check(len(source.data.uv_layers) == 8, "original object keeps all 8 UV maps")
     ok &= check(gpu_result["coverage"] > 20.0, f"UV coverage {gpu_result['coverage']:.1f}%")
 
     cyc_result = baker.bake_cycles_atlas(source, resolution=RES, margin=4, samples=4,

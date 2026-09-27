@@ -501,6 +501,29 @@ def _default_uv_name(mesh):
     return next((l.name for l in layers if l.active_render), layers[0].name)
 
 
+def _referenced_uv_maps(obj):
+    """Names of UV maps / attributes that any of the object's materials read."""
+    names, seen = set(), set()
+
+    def scan(tree):
+        if tree is None or tree.as_pointer() in seen:
+            return
+        seen.add(tree.as_pointer())
+        for node in tree.nodes:
+            uv_map = getattr(node, "uv_map", "")
+            if uv_map:
+                names.add(uv_map)
+            if node.type == 'ATTRIBUTE' and node.attribute_name:
+                names.add(node.attribute_name)
+            if node.type == 'GROUP':
+                scan(node.node_tree)
+
+    for slot in obj.material_slots:
+        if slot.material is not None:
+            scan(slot.material.node_tree)
+    return names
+
+
 def _check_source(source):
     if source is None or source.type != 'MESH':
         raise RuntimeError("Select a mesh object to bake.")
@@ -534,9 +557,21 @@ def _prepare_target(source, angle_limit, island_margin, log):
         coll.objects.link(target)
 
     mesh = target.data
-    if len(mesh.uv_layers) >= 8:
-        raise RuntimeError("The mesh already has 8 UV maps (Blender's limit); remove one first.")
     default_uv = _default_uv_name(mesh)
+    # Make room for the atlas UV map (Blender allows 8): drop UV maps on the
+    # copy that no material reads. The original object is left untouched.
+    keep = _referenced_uv_maps(source)
+    if default_uv is not None:
+        keep.add(default_uv)
+    keep.discard(BAKE_UV_NAME)
+    unused = [l.name for l in mesh.uv_layers if l.name not in keep]
+    for uv_name in unused:
+        mesh.uv_layers.remove(mesh.uv_layers[uv_name])
+    if unused:
+        log(f"  removed {len(unused)} unused UV map(s) from the copy: {', '.join(unused)}")
+    if len(mesh.uv_layers) >= 8:
+        raise RuntimeError("All 8 UV maps are used by the materials, so there is no room for the "
+                           "atlas UV map. Remove one UV map from the object first.")
     bake_uv = mesh.uv_layers.new(name=BAKE_UV_NAME, do_init=False)
     mesh.uv_layers.active = bake_uv
     if default_uv is not None:
