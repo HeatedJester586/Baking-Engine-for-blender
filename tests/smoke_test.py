@@ -87,6 +87,8 @@ def build_scene():
         "wood": noise(32), "keytar": noise(32), "orm": noise(32), "normal": noise(32),
         "alpha": noise(32, gray=True), "big": noise(64), "tiled": noise(16),
         "mixed_base": noise(32),
+        "whammy_base": noise(32), "whammy_rough": noise(32, gray=True),
+        "whammy_metal": noise(32, gray=True), "whammy_normal": noise(32),
     }
     ramp = np.zeros((16, 16, 4), np.uint8)
     ramp[..., :3] = (np.arange(16) * 16)[None, :, None]  # smooth left-to-right gradient
@@ -104,6 +106,11 @@ def build_scene():
         "tiled": make_image("tiled", px["tiled"], False),
         "mixed_base": make_image("mixed_BaseColor", px["mixed_base"], False),
         "ramp": make_image("mixed_Roughness_16px", px["ramp"], True),
+        # Like the user's whammy bar: every texture left as sRGB.
+        "whammy_base": make_image("whammy_bar_BaseColor", px["whammy_base"], False),
+        "whammy_rough": make_image("whammy_bar_Roughness", px["whammy_rough"], False),
+        "whammy_metal": make_image("whammy_bar_Metallic", px["whammy_metal"], False),
+        "whammy_normal": make_image("TEX_Guitar_02_Normal", px["whammy_normal"], False),
     }
 
     wood, tree, bsdf = new_material("Wood")
@@ -143,6 +150,12 @@ def build_scene():
     tree.links.new(image_node(tree, img["mixed_base"]).outputs["Color"], bsdf.inputs["Base Color"])
     tree.links.new(image_node(tree, img["ramp"]).outputs["Color"], bsdf.inputs["Roughness"])
 
+    # Game-rip wiring: sRGB data maps and a normal texture plugged straight into Normal.
+    whammy, tree, bsdf = new_material("MAT_Guitar_02")
+    for key, socket in (("whammy_base", "Base Color"), ("whammy_rough", "Roughness"),
+                        ("whammy_metal", "Metallic"), ("whammy_normal", "Normal")):
+        tree.links.new(image_node(tree, img[key]).outputs["Color"], bsdf.inputs[socket])
+
     mesh = bpy.data.meshes.new("guitar")
     bm = bmesh.new()
     uv_layer = bm.loops.layers.uv.new("UVMap")
@@ -158,6 +171,7 @@ def build_scene():
         (6, square),
         (7, square),
         (8, square),
+        (9, square),
     ]
     for i, (mat_index, uvs) in enumerate(faces):
         x = i * 1.5
@@ -173,7 +187,7 @@ def build_scene():
 
     obj = bpy.data.objects.new("guitar.036", mesh)
     bpy.context.scene.collection.objects.link(obj)
-    for mat in (wood, keytar_a, keytar_b, strings, carbon, partial, tiled, None, mixed):
+    for mat in (wood, keytar_a, keytar_b, strings, carbon, partial, tiled, None, mixed, whammy):
         mesh.materials.append(mat)
     bpy.context.view_layer.objects.active = obj
     obj.select_set(True)
@@ -202,6 +216,11 @@ def build_scene():
     # is compared against a smooth sample of the source with a small tolerance.
     expect[8] = {"BaseColor": ("tex", px["mixed_base"], [0, 1, 2], 1),
                  "Roughness": ("smooth", px["ramp"], [0], 1)}
+    # Raw texel values, even though the data maps are tagged sRGB.
+    expect[9] = {"BaseColor": ("tex", px["whammy_base"], [0, 1, 2], 1),
+                 "Roughness": ("tex", px["whammy_rough"], [0], 1),
+                 "Metallic": ("tex", px["whammy_metal"], [0], 1),
+                 "Normal": ("tex", px["whammy_normal"], [0, 1, 2], 1)}
     return obj, expect
 
 
@@ -277,7 +296,7 @@ def main():
         print("      face %d %s: got %s want %s" % m)
 
     # UV islands are moved, never rescaled: texel density is unchanged.
-    textured = {0: 32, 1: 32, 2: 32, 4: 32, 5: 64, 6: 32, 8: 32}
+    textured = {0: 32, 1: 32, 2: 32, 4: 32, 5: 64, 6: 32, 8: 32, 9: 32}
     dens_ok = True
     for face in mesh.polygons:
         if face.material_index in textured:
@@ -287,11 +306,11 @@ def main():
             dens_ok &= abs(src_len - dst_len) < 1e-3
     ok &= check(dens_ok, "texel density preserved (UV islands not resized)")
 
-    ok &= check(result["groups"] == 8, f"duplicate materials merged ({result['groups']} unique of 9 slots)")
+    ok &= check(result["groups"] == 9, f"duplicate materials merged ({result['groups']} unique of 10 slots)")
     ok &= check(result["flat_chunks"] >= 2, f"flat-colour materials shrunk ({result['flat_chunks']} flat chunks)")
     ok &= check(size == 128, f"smallest atlas that fits was picked ({size} x {size}, "
                              f"{result['filled']:.0%} filled)")
-    ok &= check(len(source.data.uv_layers) == 8 and len(source.material_slots) == 9,
+    ok &= check(len(source.data.uv_layers) == 8 and len(source.material_slots) == 10,
                 "original object untouched")
     ok &= check(len(target.material_slots) == 1 and
                 [l.name for l in target.data.uv_layers] == [baker.ATLAS_UV_NAME],

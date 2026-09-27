@@ -440,6 +440,13 @@ def _resolve_normal(socket, warn, depth=0):
     if node.type == 'BUMP' and depth < 8:
         warn(f"Bump '{node.name}': height detail is not transferred, only its Normal input")
         return _resolve_normal(node.inputs["Normal"], warn, depth + 1)
+    # A normal-map texture wired straight into Normal (common in game rips):
+    # treat it as the tangent-space normal map it is meant to be.
+    src = _resolve(socket, warn, depth + 1)
+    if src.image is not None:
+        warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node; "
+             "it is used as a tangent-space normal map")
+        return src
     warn(f"'{node.name}' ({node.bl_idname}) feeding Normal is not supported; using a flat normal")
     return flat
 
@@ -473,9 +480,9 @@ def _check_colorspace(channel, src, warn):
     if channel in _COLOR_CHANNELS and data:
         warn(f"{channel} image '{src.image.name}' is set to Non-Color")
     elif channel not in _COLOR_CHANNELS and channel != "Alpha" and not data:
-        warn(f"{channel} image '{src.image.name}' uses the "
-             f"'{src.image.colorspace_settings.name}' colour space, so Blender "
-             "gamma-decodes it; set it to Non-Color if it holds raw data")
+        warn(f"{channel} image '{src.image.name}' is tagged "
+             f"'{src.image.colorspace_settings.name}'; its raw values are used, like a game "
+             "engine would (the atlas is Non-Color)")
 
 
 def build_plan(obj):
@@ -705,12 +712,13 @@ class _Texture:
         self.key = (digest, width, height, self.is_float, self.srgb)
         self._mean = None
 
-    def linear(self, raw):
-        """Raw texels -> float32 scene-linear values, as Blender renders them."""
+    def linear(self, raw, decode=True):
+        """Raw texels -> float32 values. ``decode`` turns sRGB colours into
+        scene-linear ones; data maps (roughness, normals...) use the raw values."""
         if self.is_float:
             return raw.astype(np.float32)
         out = raw.astype(np.float32) * (1.0 / 255.0)
-        if self.srgb:
+        if self.srgb and decode:
             out[..., :3] = _SRGB_TO_LINEAR[raw[..., :3]]
         return out
 
@@ -722,7 +730,7 @@ class _Texture:
         ys = _wrap_index(np.arange(y0, y0 + h), self.height, wrap)
         return self.data[ys[:, None], xs[None, :]]
 
-    def bilinear(self, px, py, wrap):
+    def bilinear(self, px, py, wrap, decode=True):
         """Linear values at texel coordinates (texel centres sit at i + 0.5)."""
         x, y = px - 0.5, py - 0.5
         xf, yf = np.floor(x), np.floor(y)
@@ -730,15 +738,19 @@ class _Texture:
         xi, yi = xf.astype(np.int64), yf.astype(np.int64)
         x0, x1 = _wrap_index(xi, self.width, wrap), _wrap_index(xi + 1, self.width, wrap)
         y0, y1 = _wrap_index(yi, self.height, wrap), _wrap_index(yi + 1, self.height, wrap)
-        lin = self.linear
+        def lin(texels):
+            return self.linear(texels, decode)
+
         lower = lin(self.data[y0, x0]) * (1 - fx) + lin(self.data[y0, x1]) * fx
         upper = lin(self.data[y1, x0]) * (1 - fx) + lin(self.data[y1, x1]) * fx
         return lower * (1 - fy) + upper * fy
 
-    def mean(self):
+    def mean(self, decode=True):
         if self._mean is None:
-            self._mean = self.linear(self.data).reshape(-1, 4).mean(axis=0)
-        return self._mean
+            self._mean = {}
+        if decode not in self._mean:
+            self._mean[decode] = self.linear(self.data, decode).reshape(-1, 4).mean(axis=0)
+        return self._mean[decode]
 
 
 class _TextureCache:
@@ -1022,21 +1034,21 @@ def _verbatim_channels(src, tex, kind, rotation):
             return None
         if kind == "srgb" and tex.srgb:
             return [0, 1, 2]
-        if kind == "normal" and not tex.srgb and src.strength == 1.0 and rotation is None:
+        if kind == "normal" and src.strength == 1.0 and rotation is None:
             return [0, 1, 2]
         return None
     hot = [i for i, w in enumerate(src.mask) if w]
     if len(hot) != 1 or src.mask[hot[0]] != 1.0 or src.scale[0] != 1.0 or src.offset[0] != 0.0:
         return None
     k = hot[0]
-    if kind == "linear" and (k == 3 or not tex.srgb):
+    if kind == "linear":
         return [k]
     if kind == "srgb" and k < 3 and tex.srgb:
         return [k, k, k]
     return None
 
 
-def _resample(chunk, master, src, tex):
+def _resample(chunk, master, src, tex, decode):
     """Linear values of ``src`` on the chunk's atlas texels (bilinear)."""
     affine = _affine2x3(src.uv_affine)
     out = np.empty((chunk.ah, chunk.aw, 4), np.float32)
@@ -1047,7 +1059,7 @@ def _resample(chunk, master, src, tex):
         u, v = master.to_uv(px, py)
         tx = (affine[0, 0] * u + affine[0, 1] * v + affine[0, 2]) * tex.width
         ty = (affine[1, 0] * u + affine[1, 1] * v + affine[1, 2]) * tex.height
-        out[row:row + len(ys)] = tex.bilinear(tx, ty, src.wrap)
+        out[row:row + len(ys)] = tex.bilinear(tx, ty, src.wrap, decode)
     return out
 
 
@@ -1060,6 +1072,7 @@ def _block(ctx, group, chunk, channel):
         return np.broadcast_to(chunk.flat[channel], shape)
     src = group.sources[channel]
     rotation = group.normal_rotation if channel == "Normal" else None
+    decode = kind == "srgb"  # only colour maps are colour managed
     strength = src.strength if channel == "Normal" else 1.0
     if src.image is None:
         value = np.asarray(src.offset[:shape[2]], np.float32).reshape(1, 1, -1)
@@ -1078,13 +1091,13 @@ def _block(ctx, group, chunk, channel):
             return raw[..., :3]
         if channels is not None:
             return raw[..., channels]
-        linear = tex.linear(raw)
+        linear = tex.linear(raw, decode)
     elif uv_layer != master.uv_layer:
         ctx.warn(f"'{src.image.name}' uses UV map '{uv_layer}' while its material's main texture "
                  f"uses '{master.uv_layer}'; its average colour is used")
-        linear = tex.mean().reshape(1, 1, 4)
+        linear = tex.mean(decode).reshape(1, 1, 4)
     else:
-        linear = _resample(chunk, master, src, tex)
+        linear = _resample(chunk, master, src, tex, decode)
     encoded = _encode(_apply(src, linear, kind), kind, rotation, strength)
     return np.broadcast_to(encoded, shape)
 

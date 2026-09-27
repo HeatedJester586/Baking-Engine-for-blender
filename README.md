@@ -38,7 +38,10 @@ repacked texel for texel**:
   importer's Mix/Math "factor" nodes, Invert, Normal Map strength,
   reroutes and muted nodes.
 - **Correct colour.** Base Color and Emission atlases are sRGB, data maps
-  are Non-Color, and the values match what Blender renders.
+  are Non-Color. Roughness, Metallic and Normal textures are always read
+  as raw values (like a game engine), even if they are tagged sRGB.
+- **Game-rip friendly.** A normal texture plugged straight into Normal
+  (without a Normal Map node) is treated as a tangent-space normal map.
 - **Padding** of real neighbouring texels around every island, so
   mipmaps do not bleed.
 - **Diagnostics report** that lists, for every slot, which image and channel
@@ -131,9 +134,6 @@ in the console:
 
 - **Pink areas:** a source image could not be loaded. The diagnostics report
   names the file. Use *File > External Data > Find Missing Files*.
-- **Roughness/Metallic look too dark or too glossy:** the report warns when a
-  data texture is tagged sRGB. Blender renders it that way too; set the
-  source image to Non-Color if that is wrong.
 - **Warnings:** open *Window > Toggle System Console* to see the
   `[PBR Atlas]` log.
 
