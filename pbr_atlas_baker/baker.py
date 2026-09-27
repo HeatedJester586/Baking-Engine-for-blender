@@ -553,11 +553,13 @@ def _resolve_displacement(material, warn):
     return _resolve(socket, warn).to_scalar(), (0.0, 1.0)
 
 
-def build_plan(obj, direct_normals=True):
+def build_plan(obj, direct_normals=True, overrides=None):
     """Work out, for every material slot, where each PBR channel comes from.
 
-    Returns a list (one entry per slot) of dicts with ``material``,
-    ``sources`` ({channel: ChannelSource}) and ``warnings``.
+    ``overrides`` maps a material name to {"normal": bool, "displacement":
+    bool}, overriding ``direct_normals`` and the automatic displacement choice
+    for that material. Returns a list (one entry per slot) of dicts with
+    ``material``, ``sources`` ({channel: ChannelSource}) and ``warnings``.
     """
     slots = list(obj.material_slots) or [None]
     plan = []
@@ -589,9 +591,16 @@ def build_plan(obj, direct_normals=True):
         # atlas copies the original look, leave that displacement out too.
         normal_node = _upstream(bsdf.inputs["Normal"])[0] if bsdf is not None else None
         overridden = normal_node is not None and normal_node.type not in ('NORMAL_MAP', 'BUMP')
-        if overridden and displacement is not None and not direct_normals:
-            warn("its displacement does not show in Blender because a texture is plugged "
-                 "straight into Normal; it is left out to match the original", note=True)
+        choice = (overrides or {}).get(material.name, {}) if material is not None else {}
+        use_normal = choice.get("normal", direct_normals)
+        has_displacement = displacement is not None
+        keep_displacement = choice.get("displacement", not overridden or use_normal)
+        if has_displacement and not keep_displacement:
+            if "displacement" in choice:
+                warn("displacement turned off for this material", note=True)
+            else:
+                warn("its displacement does not show in Blender because a texture is plugged "
+                     "straight into Normal; it is left out to match the original", note=True)
             height, displacement = ChannelSource(_DEFAULTS["Height"]), None
         for channel in CHANNELS:
             if channel == "Height":
@@ -599,7 +608,7 @@ def build_plan(obj, direct_normals=True):
             elif bsdf is None:
                 src = ChannelSource(_DEFAULTS[channel])
             elif channel == "Normal":
-                src = _resolve_normal(bsdf.inputs["Normal"], warn, direct_normals=direct_normals)
+                src = _resolve_normal(bsdf.inputs["Normal"], warn, direct_normals=use_normal)
             else:
                 socket = _bsdf_input(bsdf, channel)
                 src = _resolve(socket, warn) if socket is not None else ChannelSource(_DEFAULTS[channel])
@@ -615,7 +624,9 @@ def build_plan(obj, direct_normals=True):
             _check_colorspace(channel, src, warn)
             sources[channel] = src
         plan.append({"material": material, "sources": sources, "warnings": warnings,
-                     "notes": notes, "displacement": displacement})
+                     "notes": notes, "displacement": displacement,
+                     "unwired_normal": overridden, "has_displacement": has_displacement,
+                     "use_normal": use_normal, "keep_displacement": keep_displacement})
     _check_tiling(obj, plan)
     return plan
 
@@ -780,7 +791,7 @@ def _short(src):
     return text
 
 
-def check_materials(obj, direct_normals=True):
+def check_materials(obj, direct_normals=True, overrides=None):
     """What every material slot feeds into each channel, for the UI checker.
 
     Returns a list of dicts: ``name``, ``faces``, ``textures`` [(label, text)],
@@ -788,7 +799,7 @@ def check_materials(obj, direct_normals=True):
     None) and ``warnings``.
     """
     mesh = obj.data
-    plan = build_plan(obj, direct_normals)
+    plan = build_plan(obj, direct_normals, overrides)
     face_mat = np.empty(len(mesh.polygons), np.int32)
     mesh.polygons.foreach_get("material_index", face_mat)
     counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
@@ -811,6 +822,11 @@ def check_materials(obj, direct_normals=True):
             "emission": _short(emission) if emits else None,
             "displacement": _short(height) if entry["displacement"] is not None else None,
             "warnings": list(entry["warnings"]),
+            "material": mat.name if mat else None,
+            "unwired_normal": entry["unwired_normal"],
+            "has_displacement": entry["has_displacement"],
+            "use_normal": entry["use_normal"],
+            "keep_displacement": entry["keep_displacement"],
         })
     return rows
 
@@ -1589,7 +1605,7 @@ def _write_text(name, lines):
 
 
 def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
-                lossless=True, raw_data=False, direct_normals=True, log=print):
+                lossless=True, raw_data=False, direct_normals=True, overrides=None, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
 
     ``max_size`` 0 means Auto: the smallest power of two that holds every
@@ -1623,7 +1639,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
             warnings.append(msg)
             log("  ! " + msg)
 
-    plan = build_plan(source, direct_normals)
+    plan = build_plan(source, direct_normals, overrides)
     for i, entry in enumerate(plan):
         for w in entry["warnings"]:
             warn(f"slot {i:02d}: {w}")

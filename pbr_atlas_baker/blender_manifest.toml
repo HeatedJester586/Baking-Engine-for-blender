@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "pbr_atlas_baker"
-version = "1.6.1"
+version = "1.7.0"
 name = "PBR Atlas Baker"
 tagline = "Repack all materials of a mesh into one lossless PBR atlas"
 maintainer = "HeatedJester586"

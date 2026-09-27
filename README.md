@@ -113,6 +113,7 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 | Lossless | on | Never shrink anything. If the textures do not fit, stop and list which materials need the room. |
 | Raw Data Maps | off | Off: sRGB-tagged roughness/metallic/height look exactly like in Blender. On: keep their raw values. |
 | Use Unwired Normal Maps | on | Normal textures without a Normal Map node: on = full bump detail, off = left out like Blender does. |
+| Per-material choices | – | After *Check Materials*, each material with an unwired normal texture or a displacement gets its own **Normal Map** / **Displacement** toggles (copies such as `.063`–`.074` share one). They override the default above. |
 | Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
 | Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |
