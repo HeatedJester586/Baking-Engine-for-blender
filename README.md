@@ -44,7 +44,10 @@ repacked texel for texel**:
   their raw values instead (game-engine style). Normal maps are always read
   raw.
 - **Game-rip friendly.** A normal texture plugged straight into Normal
-  (without a Normal Map node) is treated as a tangent-space normal map.
+  (without a Normal Map node) is used as a real tangent-space normal map.
+  Blender itself does not do that, so the original shows much less bump
+  detail; untick **Use Unwired Normal Maps** to leave those textures out
+  and match the original look.
 - **Padding** of real neighbouring texels around every island, so
   mipmaps do not bleed.
 - **Material checker.** *Check Materials* lists every slot in the panel:
@@ -108,6 +111,7 @@ in Blender's **Text Editor**, change the settings at the bottom of the file
 | Atlas Size | Auto | Auto picks the smallest power of two that keeps every texel (up to 16384). A number caps the size. |
 | Lossless | on | Never shrink anything. If the textures do not fit, stop and list which materials need the room. |
 | Raw Data Maps | off | Off: sRGB-tagged roughness/metallic/height look exactly like in Blender. On: keep their raw values. |
+| Use Unwired Normal Maps | on | Normal textures without a Normal Map node: on = full bump detail, off = left out like Blender does. |
 | Padding | 8 px | Real texels kept around every UV island. |
 | Hide Original | on | Hides the source object afterwards. |
 | Also Save PNG Files | off | Also write the atlases as PNGs to **Folder** (`//` = next to the `.blend`). |

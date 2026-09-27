@@ -26,6 +26,12 @@ class PBRAtlasSettings(bpy.types.PropertyGroup):
         description="Roughness / Metallic / Height textures tagged sRGB keep their raw values "
                     "(like a game engine). Off: they look exactly like in Blender",
     )
+    direct_normals: BoolProperty(
+        name="Use Unwired Normal Maps", default=True,
+        description="Normal textures plugged straight into Normal (no Normal Map node): on = use "
+                    "them as real normal maps (full bump detail); off = leave them out, which "
+                    "looks like the original because Blender does not use them either",
+    )
     padding: IntProperty(
         name="Padding", subtype='PIXEL', default=8, min=0, max=64,
         description="Texels of real texture kept around every UV island, so mipmaps do not bleed",
@@ -66,9 +72,10 @@ class PBRATLAS_OT_check(bpy.types.Operator):
 
     def execute(self, context):
         obj = _active_mesh(context)
-        rows = baker.check_materials(obj)
+        normals = context.scene.pbr_atlas.direct_normals
+        rows = baker.check_materials(obj, normals)
         _CHECK["object"], _CHECK["rows"] = obj.name, rows
-        print(baker.write_report(obj))
+        print(baker.write_report(obj, normals))
         warnings = sum(len(r["warnings"]) for r in rows)
         level = {'WARNING'} if warnings else {'INFO'}
         self.report(level, f"{len(rows)} material slot(s), {warnings} warning(s). "
@@ -95,6 +102,7 @@ class PBRATLAS_OT_build(bpy.types.Operator):
                 max_size=0 if settings.max_size == 'AUTO' else int(settings.max_size),
                 lossless=settings.lossless,
                 raw_data=settings.raw_data,
+                direct_normals=settings.direct_normals,
                 padding=settings.padding,
                 output_dir=settings.output_dir if settings.save_files else None,
                 hide_source=settings.hide_source,
@@ -135,6 +143,7 @@ class PBRATLAS_PT_panel(bpy.types.Panel):
         layout.prop(settings, "max_size")
         layout.prop(settings, "lossless")
         layout.prop(settings, "raw_data")
+        layout.prop(settings, "direct_normals")
         layout.prop(settings, "padding")
         layout.prop(settings, "hide_source")
         layout.prop(settings, "save_files")

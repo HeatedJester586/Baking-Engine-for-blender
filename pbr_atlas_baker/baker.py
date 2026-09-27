@@ -455,7 +455,7 @@ def _resolve(socket, warn, depth=0):
     return ChannelSource(fallback)
 
 
-def _resolve_normal(socket, warn, depth=0):
+def _resolve_normal(socket, warn, depth=0, direct_normals=True):
     flat = ChannelSource(_DEFAULTS["Normal"])
     node, _ = _upstream(socket)
     if node is None:
@@ -475,14 +475,20 @@ def _resolve_normal(socket, warn, depth=0):
         return src
     if node.type == 'BUMP' and depth < 8:
         warn(f"Bump '{node.name}': height detail is not transferred, only its Normal input")
-        return _resolve_normal(node.inputs["Normal"], warn, depth + 1)
+        return _resolve_normal(node.inputs["Normal"], warn, depth + 1, direct_normals)
     # A normal-map texture wired straight into Normal (common in game rips):
     # treat it as the tangent-space normal map it is meant to be.
     src = _resolve(socket, warn, depth + 1)
-    if src.image is not None:
+    if src.image is not None and direct_normals:
         warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node; "
-             "it is used as a tangent-space normal map", note=True)
+             "it is used as a real normal map (Blender itself does not, so the original "
+             "shows less bump detail)", note=True)
         return src
+    if src.image is not None:
+        warn(f"'{src.image.name}' is plugged straight into Normal without a Normal Map node, so "
+             "Blender does not use it as a normal map; it is left out to match the original",
+             note=True)
+        return flat
     warn(f"'{node.name}' ({node.bl_idname}) feeding Normal is not supported; using a flat normal")
     return flat
 
@@ -547,7 +553,7 @@ def _resolve_displacement(material, warn):
     return _resolve(socket, warn).to_scalar(), (0.0, 1.0)
 
 
-def build_plan(obj):
+def build_plan(obj, direct_normals=True):
     """Work out, for every material slot, where each PBR channel comes from.
 
     Returns a list (one entry per slot) of dicts with ``material``,
@@ -584,7 +590,7 @@ def build_plan(obj):
             elif bsdf is None:
                 src = ChannelSource(_DEFAULTS[channel])
             elif channel == "Normal":
-                src = _resolve_normal(bsdf.inputs["Normal"], warn)
+                src = _resolve_normal(bsdf.inputs["Normal"], warn, direct_normals=direct_normals)
             else:
                 socket = _bsdf_input(bsdf, channel)
                 src = _resolve(socket, warn) if socket is not None else ChannelSource(_DEFAULTS[channel])
@@ -713,14 +719,14 @@ def _make_target(source):
 # Diagnostics
 # ---------------------------------------------------------------------------
 
-def diagnose(obj):
+def diagnose(obj, direct_normals=True):
     """Return a text report of what will be read from every material slot."""
     lines = ["=" * 72]
     if obj is None or obj.type != 'MESH':
         lines += ["PBR ATLAS DIAGNOSTIC: no mesh object selected", "=" * 72]
         return "\n".join(lines)
     mesh = obj.data
-    plan = build_plan(obj)
+    plan = build_plan(obj, direct_normals)
     face_mat = np.empty(len(mesh.polygons), np.int32)
     mesh.polygons.foreach_get("material_index", face_mat)
     counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
@@ -765,7 +771,7 @@ def _short(src):
     return text
 
 
-def check_materials(obj):
+def check_materials(obj, direct_normals=True):
     """What every material slot feeds into each channel, for the UI checker.
 
     Returns a list of dicts: ``name``, ``faces``, ``textures`` [(label, text)],
@@ -773,7 +779,7 @@ def check_materials(obj):
     None) and ``warnings``.
     """
     mesh = obj.data
-    plan = build_plan(obj)
+    plan = build_plan(obj, direct_normals)
     face_mat = np.empty(len(mesh.polygons), np.int32)
     mesh.polygons.foreach_get("material_index", face_mat)
     counts = np.bincount(np.clip(face_mat, 0, len(plan) - 1), minlength=len(plan))
@@ -800,8 +806,8 @@ def check_materials(obj):
     return rows
 
 
-def write_report(obj):
-    report = diagnose(obj)
+def write_report(obj, direct_normals=True):
+    report = diagnose(obj, direct_normals)
     text = bpy.data.texts.get(REPORT_TEXT) or bpy.data.texts.new(REPORT_TEXT)
     text.clear()
     text.write(report)
@@ -1574,7 +1580,7 @@ def _write_text(name, lines):
 
 
 def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True,
-                lossless=True, raw_data=False, log=print):
+                lossless=True, raw_data=False, direct_normals=True, log=print):
     """Repack every material of ``source`` into one material with texture atlases.
 
     ``max_size`` 0 means Auto: the smallest power of two that holds every
@@ -1608,7 +1614,7 @@ def build_atlas(source, max_size=0, padding=8, output_dir=None, hide_source=True
             warnings.append(msg)
             log("  ! " + msg)
 
-    plan = build_plan(source)
+    plan = build_plan(source, direct_normals)
     for i, entry in enumerate(plan):
         for w in entry["warnings"]:
             warn(f"slot {i:02d}: {w}")
@@ -1778,6 +1784,7 @@ if __name__ == "__main__":
     MAX_ATLAS_SIZE = 0      # 0 = Auto; else the smallest power of two that fits, up to this
     LOSSLESS = True         # never shrink textures; stop with an explanation instead
     RAW_DATA = False        # True = sRGB-tagged roughness/metallic maps keep raw values
+    DIRECT_NORMALS = True   # use normal textures plugged in without a Normal Map node
     PADDING = 8             # texels of real texture kept around every UV island
     OUTPUT_DIR = None       # None = textures only inside the .blend;
                             # or a folder for PNG copies, e.g. "//atlas_textures/"
@@ -1787,4 +1794,4 @@ if __name__ == "__main__":
     print(write_report(source_obj))
     if not DIAGNOSE_ONLY:
         build_atlas(source_obj, max_size=MAX_ATLAS_SIZE, padding=PADDING, output_dir=OUTPUT_DIR,
-                    lossless=LOSSLESS, raw_data=RAW_DATA)
+                    lossless=LOSSLESS, raw_data=RAW_DATA, direct_normals=DIRECT_NORMALS)
