@@ -29,6 +29,9 @@ the result looks like the original.
   channel-packed textures, Color Ramps, Mix/Math nodes, Mapping (tiling),
   Normal Map and Bump nodes, displacement, emission and alpha. Textures that
   are wired unusually are reproduced as Blender shows them.
+- **Node groups.** Follows textures and settings into node groups (also
+  nested ones), so Character Creator / CC4 and other imported shaders work.
+  See-through overlay materials (eye occlusion, tear lines) stay invisible.
 - **Material check.** Lists every material and what feeds each channel, with
   warnings and hints about wiring that looks like a mistake.
 - Everything is stored inside the `.blend`; PNG export is optional.
