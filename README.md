@@ -32,6 +32,11 @@ the result looks like the original.
 - **Node groups.** Follows textures and settings into node groups (also
   nested ones), so Character Creator / CC4 and other imported shaders work.
   See-through overlay materials (eye occlusion, tear lines) stay invisible.
+- **Node math.** Setups that combine several textures (AO multiply, masks,
+  Hue/Saturation/Value, Gamma, Brightness/Contrast, Math, Mix with a texture
+  factor, Color Ramps...) are calculated per texel exactly like Blender's
+  nodes. Mix Shaders on the output (e.g. a blood layer over skin) are blended
+  per texel too. Simple texture hookups are still copied byte for byte.
 - **Material check.** Lists every material and what feeds each channel, with
   warnings and hints about wiring that looks like a mistake.
 - Everything is stored inside the `.blend`; PNG export is optional.
