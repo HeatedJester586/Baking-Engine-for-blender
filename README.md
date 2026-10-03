@@ -37,6 +37,15 @@ the result looks like the original.
   factor, Color Ramps...) are calculated per texel exactly like Blender's
   nodes. Mix Shaders on the output (e.g. a blood layer over skin) are blended
   per texel too. Simple texture hookups are still copied byte for byte.
+- **Procedural logic.** Texture coordinates computed with math (scaled irises,
+  pivots, tiling groups), UV-based masks, colour attributes (vertex colours),
+  RGB Curves and Map Range are followed per texel. Bump nodes are baked into
+  the normal map, Normal Map strength can come from a texture, and normals
+  blended by a Mix Shader are blended too.
+- **Matches Blender's quirks.** Colour textures with transparency are dimmed
+  by their alpha like Blender does, and glass-like materials (corneas) keep
+  raytraced transmission. View-dependent nodes (Fresnel, Layer Weight) use
+  their head-on value.
 - **Material check.** Lists every material and what feeds each channel, with
   warnings and hints about wiring that looks like a mistake.
 - Everything is stored inside the `.blend`; PNG export is optional.
