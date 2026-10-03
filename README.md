@@ -46,6 +46,11 @@ the result looks like the original.
   by their alpha like Blender does, and glass-like materials (corneas) keep
   raytraced transmission. View-dependent nodes (Fresnel, Layer Weight) use
   their head-on value.
+- **Fix Textures.** One click repairs common mistakes in the original
+  materials: adds missing Normal Map nodes (normal maps plugged straight into
+  Normal), adds a Displacement node for height maps plugged straight into the
+  output, sets roughness / metallic / normal / height maps to Non-Color and
+  colour maps to sRGB. Lists every change; Ctrl+Z undoes it.
 - **Material check.** Lists every material and what feeds each channel, with
   warnings and hints about wiring that looks like a mistake.
 - Everything is stored inside the `.blend`; PNG export is optional.
@@ -65,7 +70,9 @@ Requires **Blender 4.2 or newer**.
 1. Select the mesh.
 2. Optional: click **Check Materials** and look through the **Material Check**
    list.
-3. Click **Build Atlas**.
+3. Optional: click **Fix Textures** to repair wiring mistakes in the original
+   (the list of changes is written to `BOMBOCLAT_FIX_REPORT.txt`).
+4. Click **Build Atlas**.
 
 You get a copy of the object named `<name>_ATLAS` with one UV map and one
 material whose Principled BSDF uses the new textures. A build log is written
